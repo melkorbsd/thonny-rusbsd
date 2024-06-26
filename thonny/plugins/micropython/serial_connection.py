@@ -19,7 +19,6 @@ logger = getLogger(__name__)
 
 class SerialConnection(MicroPythonConnection):
     def __init__(self, port, baudrate=115200, dtr=None, rts=None, skip_reader=False):
-
         import serial
         from serial.serialutil import SerialException
 
@@ -29,11 +28,17 @@ class SerialConnection(MicroPythonConnection):
             self._serial = serial.Serial(
                 port=None, baudrate=baudrate, timeout=None, write_timeout=2, exclusive=True
             )
+            logger.info(
+                "Before opening serial port, DTR=%r, RTS=%r", self._serial.dtr, self._serial.rts
+            )
             # Tweaking dtr and rts was proposed by
             # https://github.com/thonny/thonny/pull/1187
             # but in some cases it messes up communication.
             # At the same time, in some cases it is required
             # https://github.com/thonny/thonny/issues/1462
+            # More information:
+            #   https://github.com/npat-efault/picocom/blob/master/lowerrts.md
+            #   https://github.com/micropython/micropython/pull/11076
             if dtr is not None:
                 logger.debug("Setting DTR to %s", dtr)
                 self._serial.dtr = dtr
@@ -159,7 +164,6 @@ class DifficultSerialConnection(SerialConnection):
     """For hardening the communication protocol"""
 
     def _make_output_available(self, data, block=True):
-
         # output prompts in parts
         if FIRST_RAW_PROMPT in data or NORMAL_PROMPT in data:
             if FIRST_RAW_PROMPT in data:

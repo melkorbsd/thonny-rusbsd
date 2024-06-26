@@ -1,3 +1,4 @@
+import os.path
 import shutil
 from tkinter import messagebox
 from typing import Any, Dict, Optional
@@ -30,15 +31,20 @@ class SshCPythonProxy(SubprocessProxy):
         return True
 
     def _get_launcher_with_args(self):
+        launcher_file = os.path.join(os.path.dirname(__file__), "cps_back.py")
         return [
-            "-m",
-            "thonny.plugins.cpython_ssh.cps_back",
+            launcher_file,
             repr(
                 {
                     "host": self._host,
                     "user": self._user,
                     "interpreter": self._target_executable,
                     "cwd": self._get_initial_cwd(),
+                    "main_backend_options": {
+                        "run.warn_module_shadowing": get_workbench().get_option(
+                            "run.warn_module_shadowing"
+                        )
+                    },
                 }
             ),
         ]
@@ -138,11 +144,6 @@ class SshCPythonProxy(SubprocessProxy):
         confs = sorted(cls.get_last_configurations(), key=cls.get_switcher_configuration_label)
         return [(conf, cls.get_switcher_configuration_label(conf)) for conf in confs]
 
-    def get_pip_gui_class(self):
-        from thonny.plugins.cpython_ssh.cps_pip_gui import SshCPythonPipDialog
-
-        return SshCPythonPipDialog
-
     def has_custom_system_shell(self):
         return True
 
@@ -166,6 +167,9 @@ class SshCPythonProxy(SubprocessProxy):
     @classmethod
     def is_valid_configuration(cls, conf: Dict[str, Any]) -> bool:
         return True
+
+    def can_install_packages_from_files(self) -> bool:
+        return False
 
 
 class SshProxyConfigPage(BaseSshProxyConfigPage):

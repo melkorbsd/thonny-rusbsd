@@ -22,15 +22,34 @@ from logging import getLogger
 from threading import Thread
 from time import sleep
 from tkinter import messagebox, ttk
-from typing import Any, Callable, Dict, List, Optional, Set, Union  # @UnusedImport; @UnusedImport
+from typing import (  # @UnusedImport; @UnusedImport
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import thonny
-from thonny import THONNY_USER_DIR, common, get_runner, get_shell, get_workbench, report_time
+from thonny import (
+    common,
+    get_runner,
+    get_shell,
+    get_thonny_user_dir,
+    get_version,
+    get_workbench,
+    report_time,
+)
 from thonny.common import (
+    PROCESS_ACK,
     BackendEvent,
     CommandToBackend,
     DebuggerCommand,
     DebuggerResponse,
+    DistInfo,
     EOFCommand,
     InlineCommand,
     InlineResponse,
@@ -80,15 +99,54 @@ INTERRUPT_SEQUENCE = "<Control-c>"
 CSI_TERMINATOR = re.compile("[@-~]")
 OSC_TERMINATOR = re.compile(r"\a|\x1B\\")
 
+TERMINATION_TIMEOUT = 2
+TERMINATION_POLL_INTERVAL = 0.02
+
 # other components may turn it on in order to avoid grouping output lines into one event
 io_animation_required = False
 
 _console_allocated = False
 
+BASE_MODULES = [
+    "_abc",
+    "_codecs",
+    "_collections_abc",
+    "_distutils_hack",
+    "_frozen_importlib",
+    "_frozen_importlib_external",
+    "_imp",
+    "_io",
+    "_signal",
+    "_sitebuiltins",
+    "_stat",
+    "_thread",
+    "_warnings",
+    "_weakref",
+    "_winapi",
+    "abc",
+    "builtins",
+    "codecs",
+    "encodings",
+    "genericpath",
+    "io",
+    "marshal",
+    "nt",
+    "ntpath",
+    "os",
+    "site",
+    "stat",
+    "sys",
+    "time",
+    "winreg",
+    "zipimport",
+]
+
 
 class Runner:
     def __init__(self) -> None:
+        get_workbench().set_default("run.allow_running_unnamed_programs", True)
         get_workbench().set_default("run.auto_cd", True)
+        get_workbench().set_default("run.warn_module_shadowing", True)
 
         self._init_commands()
         self._state = "starting"
@@ -309,15 +367,12 @@ class Runner:
         assert self.is_running()
         self._proxy.send_program_input(data)
 
-    def execute_script(
+    def execute_via_shell(
         self,
-        script_path: str,
-        args: List[str],
+        cmd_line: Union[str, List[str]],
         working_directory: Optional[str] = None,
-        command_name: str = "Run",
     ) -> None:
-
-        if self._proxy.get_cwd() != working_directory:
+        if working_directory and self._proxy.get_cwd() != working_directory:
             # create compound command
             # start with %cd
             cd_cmd_line = construct_cd_command(working_directory) + "\n"
@@ -325,15 +380,27 @@ class Runner:
             # create simple command
             cd_cmd_line = ""
 
-        rel_filename = universal_relpath(script_path, working_directory)
-        cmd_parts = ["%" + command_name, rel_filename] + args
-        exe_cmd_line = construct_cmd_line(cmd_parts, [EDITOR_CONTENT_TOKEN]) + "\n"
+        if not isinstance(cmd_line, str):
+            cmd_line = construct_cmd_line(cmd_line)
 
         # submit to shell (shell will execute it)
-        get_shell().submit_magic_command(cd_cmd_line + exe_cmd_line)
+        get_shell().submit_magic_command(cd_cmd_line + cmd_line)
+
+    def execute_script(
+        self,
+        script_path: str,
+        args: List[str],
+        working_directory: Optional[str],
+        command_name: str = "Run",
+    ) -> None:
+        rel_filename = universal_relpath(script_path, working_directory)
+        cmd_parts = ["%" + command_name, rel_filename] + args
+        cmd_line = construct_cmd_line(cmd_parts, [EDITOR_CONTENT_TOKEN])
+
+        self.execute_via_shell(cmd_line, working_directory)
 
     def execute_editor_content(self, command_name, args):
-        if command_name.lower() == "debug":
+        if command_name.lower() in ["debug", "fastdebug"]:
             messagebox.showinfo(
                 tr("Information"),
                 tr("For debugging the program must be saved first."),
@@ -363,6 +430,7 @@ class Runner:
         )
 
         if not self.is_waiting_toplevel_command():
+            logger.info("Trying to execute current but runner is %r", self.get_state())
             self._proxy.interrupt()
 
             try:
@@ -393,11 +461,18 @@ class Runner:
             return
 
         UNTITLED = "<untitled>"
-        if editor.get_filename():
-            filename = editor.save_file()
-            if not filename:
-                # user has cancelled file saving
-                return
+        if editor.get_filename() or not get_workbench().get_option(
+            "run.allow_running_unnamed_programs"
+        ):
+            if editor.get_filename() and not editor.is_modified():
+                # Don't attempt to save as the file may be read-only
+                logger.debug("Not saving read only file %s", editor.get_filename())
+                filename = editor.get_filename()
+            else:
+                filename = editor.save_file()
+                if not filename:
+                    # user has cancelled file saving
+                    return
         else:
             filename = UNTITLED
 
@@ -510,6 +585,8 @@ class Runner:
                     return None
             elif isinstance(widget, (tk.Listbox, ttk.Entry, tk.Entry, tk.Spinbox)):
                 try:
+                    # NB! On Linux, selection_get() gives X selection
+                    # i.e. it may be from another application when Thonny has nothing selected
                     selection = widget.selection_get()
                     if isinstance(selection, str) and len(selection) > 0:
                         # Assuming user meant to copy, not interrupt
@@ -630,7 +707,7 @@ class Runner:
         err = f"Process ended with exit code {returncode}."
 
         try:
-            faults_file = os.path.join(THONNY_USER_DIR, "backend_faults.log")
+            faults_file = os.path.join(get_thonny_user_dir(), "backend_faults.log")
             if os.path.exists(faults_file):
                 with open(faults_file, encoding="ASCII", errors="replace") as fp:
                     err += fp.read()
@@ -652,8 +729,9 @@ class Runner:
 
     def restart_backend(self, clean: bool, first: bool = False, automatic: bool = False) -> None:
         """Recreate (or replace) backend proxy / backend process."""
-
+        was_running = self.is_running()
         self.destroy_backend()
+        self._last_accepted_backend_command = None
         backend_name = get_workbench().get_option("run.backend_name")
         if backend_name not in get_workbench().get_backends():
             raise UserError(
@@ -668,7 +746,7 @@ class Runner:
         self._poll_backend_messages()
 
         if not first:
-            get_shell().restart(automatic=automatic)
+            get_shell().restart(automatic=automatic, was_running=was_running)
             get_shell().update_idletasks()
 
         get_workbench().event_generate("BackendRestart", full=True)
@@ -736,7 +814,7 @@ class Runner:
                     "Device is busy -- can't perform this action now."
                     + "\nPlease wait or cancel current work and try again!"
                 )
-            messagebox.showerror("Can't complete", msg, master=get_workbench())
+            messagebox.showerror(tr("Can't complete"), msg, master=get_workbench())
 
         return ready
 
@@ -760,8 +838,11 @@ class Runner:
 
     def using_venv(self) -> bool:
         from thonny.plugins.cpython_frontend import LocalCPythonProxy
+        from thonny.plugins.cpython_ssh.cps_front import SshCPythonProxy
 
-        return isinstance(self._proxy, LocalCPythonProxy) and self._proxy._in_venv
+        return (
+            isinstance(self._proxy, (LocalCPythonProxy, SshCPythonProxy)) and self._proxy._in_venv
+        )
 
 
 class BackendProxy(ABC):
@@ -803,9 +884,6 @@ class BackendProxy(ABC):
     def get_backend_name(self):
         return type(self).backend_name
 
-    def get_pip_gui_class(self):
-        return None
-
     @abstractmethod
     def interrupt(self):
         """Tries to interrupt current command without resetting the backend"""
@@ -819,12 +897,10 @@ class BackendProxy(ABC):
         ...
 
     @abstractmethod
-    def is_connected(self):
-        ...
+    def is_connected(self): ...
 
     @abstractmethod
-    def has_local_interpreter(self):
-        ...
+    def has_local_interpreter(self): ...
 
     @abstractmethod
     def get_target_executable(self) -> Optional[str]:
@@ -865,8 +941,7 @@ class BackendProxy(ABC):
         raise NotImplementedError()
 
     @abstractmethod
-    def can_debug(self) -> bool:
-        ...
+    def can_debug(self) -> bool: ...
 
     def ready_for_remote_file_operations(self):
         return False
@@ -892,8 +967,7 @@ class BackendProxy(ABC):
         """
 
     @abstractmethod
-    def can_run_in_terminal(self) -> bool:
-        ...
+    def can_run_in_terminal(self) -> bool: ...
 
     def run_script_in_terminal(self, script_path, args, interactive, keep_open):
         raise NotImplementedError()
@@ -903,6 +977,59 @@ class BackendProxy(ABC):
 
     def open_custom_system_shell(self) -> None:
         raise NotImplementedError()
+
+    def get_package_installation_confirmations(self, dist_info: DistInfo) -> List[str]:
+        if "thonny" in dist_info.name.lower():
+            return [
+                tr(
+                    "Looks like you are installing a Thonny-related package.\n"
+                    + "If you meant to install a Thonny plugin, then you should\n"
+                    + "choose 'Tools → Manage plugins...' instead\n"
+                    + "\n"
+                    + "Are you sure you want to install %s for the back-end?"
+                )
+                % dist_info.name
+            ]
+
+        return []
+
+    def supports_packages(self) -> bool:
+        return True
+
+    @abstractmethod
+    def get_packages_target_dir_with_comment(self) -> Tuple[Optional[str], Optional[str]]:
+        raise NotImplementedError()
+
+    @abstractmethod
+    def can_install_packages_from_files(self) -> bool:
+        raise NotImplementedError()
+
+    def normalize_target_path(self, path: str) -> str:
+        return path
+
+    @classmethod
+    def search_packages(cls, query: str) -> List[DistInfo]:
+        from thonny.plugins.pip_gui import perform_pypi_search
+
+        return perform_pypi_search(query)
+
+    @classmethod
+    def get_package_info_from_index(cls, name: str, version: str) -> DistInfo:
+        from thonny.plugins.pip_gui import download_dist_info_from_pypi
+
+        return download_dist_info_from_pypi(name, version)
+
+    def get_version_list_from_index(self, name: str) -> List[str]:
+        from thonny.plugins.pip_gui import try_download_version_list_from_pypi
+
+        return try_download_version_list_from_pypi(name)
+
+    def get_search_button_text(self) -> str:
+        return tr("Search on PyPI")
+
+    @classmethod
+    def get_stubs_location(cls):
+        return os.path.join(thonny.get_thonny_user_dir(), "stubs", cls.backend_name)
 
 
 class SubprocessProxy(BackendProxy, ABC):
@@ -923,6 +1050,7 @@ class SubprocessProxy(BackendProxy, ABC):
         self._response_queue = None
         self._sys_path = []
         self._usersitepackages = None
+        self._externally_managed = None
         self._reported_executable = None
         self._gui_update_loop_id = None
         self._in_venv = None
@@ -978,11 +1106,14 @@ class SubprocessProxy(BackendProxy, ABC):
         # see https://github.com/thonny/thonny/issues/808
         env["PYTHONUNBUFFERED"] = "1"
 
+        env["PYTHONSAFEPATH"] = "1"
+
         # Let back-end know about plug-ins
-        env["THONNY_USER_DIR"] = THONNY_USER_DIR
+        env["THONNY_USER_DIR"] = get_thonny_user_dir()
         env["THONNY_FRONTEND_SYS_PATH"] = repr(sys.path)
 
         env["THONNY_LANGUAGE"] = get_workbench().get_option("general.language")
+        env["THONNY_VERSION"] = get_version()
 
         if thonny.in_debug_mode():
             env["THONNY_DEBUG"] = "1"
@@ -999,10 +1130,6 @@ class SubprocessProxy(BackendProxy, ABC):
                 f"Interpreter {self._mgmt_executable!r} not found.\nPlease select another!"
             )
             return
-            # raise UserError(
-            #    "Interpreter (%s) not found. Please recheck corresponding option!"
-            #    % self._mgmt_executable
-            # )
 
         cmd_line = (
             [
@@ -1014,6 +1141,9 @@ class SubprocessProxy(BackendProxy, ABC):
             + self._get_launcher_with_args()
             + extra_args
         )
+
+        if self.can_be_isolated():
+            cmd_line.insert(1, "-s")
 
         creationflags = 0
         if running_on_windows():
@@ -1035,17 +1165,30 @@ class SubprocessProxy(BackendProxy, ABC):
             encoding="utf-8",
         )
 
-        self._send_initial_input()
+        # read success acknowledgement
+        ack = self._proc.stdout.readline()
 
         # setup asynchronous output listeners
         Thread(target=self._listen_stdout, args=(self._proc.stdout,), daemon=True).start()
         Thread(target=self._listen_stderr, args=(self._proc.stderr,), daemon=True).start()
 
+        # only attempt initial input if process started nicely,
+        # otherwise can't read the error from stderr
+        if ack.strip() == PROCESS_ACK:
+            self._send_initial_input()
+        else:
+            get_shell().print_error(
+                f"INTERNAL ERROR, got {ack!r} instead of {PROCESS_ACK!r}\n---\n"
+            )
+
     def _send_initial_input(self) -> None:
+        # Used for sending data sending for startup, which can't be send by other means
+        # (e.g. don't want the password to end up in logs)
+
         pass
 
     def _get_launch_cwd(self):
-        return self.get_cwd() if self.uses_local_filesystem() else None
+        return get_workbench().get_local_cwd()
 
     def _get_launcher_with_args(self):
         raise NotImplementedError()
@@ -1098,8 +1241,19 @@ class SubprocessProxy(BackendProxy, ABC):
 
     def _close_backend(self):
         if self._proc is not None and self._proc.poll() is None:
-            logger.info("Killing backend process")
-            self._proc.kill()
+            logger.info("Trying to terminate backend process")
+            self._proc.terminate()
+            # Wait a bit
+            for i in range(int(TERMINATION_TIMEOUT / TERMINATION_POLL_INTERVAL)):
+                time.sleep(TERMINATION_POLL_INTERVAL)
+                if self._proc.poll() is not None:
+                    logger.info("Terminated in %s seconds", (i + 1) * TERMINATION_POLL_INTERVAL)
+                    break
+            else:
+                logger.info(
+                    "Could terminate backend process in %s seconds. Will kill.", TERMINATION_TIMEOUT
+                )
+                self._proc.kill()
 
         self._proc = None
         self._response_queue = None
@@ -1189,6 +1343,9 @@ class SubprocessProxy(BackendProxy, ABC):
         if "usersitepackages" in msg:
             self._usersitepackages = msg["usersitepackages"]
 
+        if "externally_managed" in msg:
+            self._externally_managed = msg["externally_managed"]
+
         if "prefix" in msg:
             self._sys_prefix = msg["prefix"]
 
@@ -1198,6 +1355,9 @@ class SubprocessProxy(BackendProxy, ABC):
         if msg.get("executable"):
             self._reported_executable = msg["executable"]
 
+        if msg.get("base_executable"):
+            self._reported_base_executable = msg["base_executable"]
+
     def _publish_cwd(self, cwd):
         if self.uses_local_filesystem():
             get_workbench().set_local_cwd(cwd)
@@ -1205,9 +1365,7 @@ class SubprocessProxy(BackendProxy, ABC):
     def get_site_packages(self):
         # NB! site.sitepackages may not be present in virtualenv
         for d in self._sys_path:
-            if ("site-packages" in d or "dist-packages" in d) and path_startswith(
-                d, self._sys_prefix
-            ):
+            if d.endswith("site-packages") and path_startswith(d, self._sys_prefix):
                 return d
 
         return None
@@ -1215,11 +1373,18 @@ class SubprocessProxy(BackendProxy, ABC):
     def get_user_site_packages(self):
         return self._usersitepackages
 
+    def is_externally_managed(self):
+        return self._externally_managed or False
+
     def get_cwd(self):
         return self._cwd
 
     def get_exe_dirs(self):
         return self._exe_dirs
+
+    def can_be_isolated(self) -> bool:
+        """Says whether the backend may be launched with -s switch"""
+        return True
 
     def fetch_next_message(self):
         if not self._response_queue or len(self._response_queue) == 0:
@@ -1318,7 +1483,6 @@ def _create_python_process(
     env=None,
     universal_newlines=True,
 ):
-
     cmd = [python_exe] + args
 
     if running_on_windows():
@@ -1489,6 +1653,8 @@ class InlineCommandDialog(WorkDialog):
         self.response = None
         self._title = title
         self._instructions = instructions
+        if "id" not in cmd:
+            cmd["id"] = generate_command_id()
         self._cmd = cmd
         self.returncode = None
 

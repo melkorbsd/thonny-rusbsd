@@ -1,17 +1,25 @@
 import binascii
+import logging
 import os
 import re
 import struct
 import sys
+import textwrap
 import time
 from logging import getLogger
 from textwrap import dedent, indent
 from typing import BinaryIO, Callable, List, Optional, Union
 
+# make sure thonny folder is in sys.path (relevant in dev)
+thonny_container = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+if thonny_container not in sys.path:
+    sys.path.insert(0, thonny_container)
+
 import thonny
 from thonny import report_time
 from thonny.backend import UploadDownloadMixin, convert_newlines_if_has_shebang
 from thonny.common import (
+    PROCESS_ACK,
     BackendEvent,
     EOFCommand,
     OscEvent,
@@ -38,11 +46,16 @@ from thonny.plugins.micropython.mp_back import (
     is_continuation_byte,
     starts_with_continuation_byte,
 )
-from thonny.plugins.micropython.mp_common import PASTE_SUBMIT_MODE, RAW_PASTE_SUBMIT_MODE
+from thonny.plugins.micropython.mp_common import (
+    PASTE_SUBMIT_MODE,
+    RAW_PASTE_SUBMIT_MODE,
+    RAW_SUBMIT_MODE,
+)
 from thonny.plugins.micropython.webrepl_connection import WebReplConnection
 
 RAW_PASTE_COMMAND = b"\x05A\x01"
 RAW_PASTE_CONFIRMATION = b"R\x01"
+RAW_PASTE_REFUSAL = b"R\x00"
 RAW_PASTE_CONTINUE = b"\x01"
 
 
@@ -121,18 +134,9 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
         self._startup_time = time.time()
         self._last_inferred_fs_mount: Optional[str] = None
 
-        self._submit_mode = args.get("submit_mode", None)
-        if self._submit_mode is None:
-            self._submit_mode = self._infer_submit_mode()
-
-        self._write_block_size = args.get("write_block_size", None)
-        if self._write_block_size is None:
-            self._write_block_size = self._infer_write_block_size()
-
-        # write delay is used only with original raw submit mode
-        self._write_block_delay = args.get("write_block_delay", None)
-        if self._write_block_delay is None:
-            self._write_block_delay = self._infer_write_block_delay()
+        self._submit_mode = args.get("submit_mode", None) or "raw_paste"
+        self._write_block_size = args.get("write_block_size", None) or 127
+        self._write_block_delay = args.get("write_block_delay", None) or 0.01
 
         # Serial over Bluetooth (eg. with Robot Inventor Hub in Windows) may need
         # flow control even for data read from the device.
@@ -169,7 +173,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
         self._prepare_after_soft_reboot(False)
 
     def _get_helper_code(self):
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             return super()._get_helper_code()
 
         result = super()._get_helper_code()
@@ -224,16 +228,6 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
 
         return result
 
-    def _infer_write_block_size(self):
-        # https://forum.micropython.org/viewtopic.php?f=15&t=3698
-        # https://forum.micropython.org/viewtopic.php?f=15&t=4896&p=28132
-
-        # M5Stack Atom (FT232 USB) may produce corrupted output on Windows with
-        # paste mode and larger block sizes (problem confirmed with 128, 64 and 30 bytes blocks)
-        # https://github.com/thonny/thonny/issues/2143
-        # Don't know any other good solutions besides avoiding paste mode for this device.
-        return 127
-
     def _infer_read_block_size(self):
         # TODO:
         # in Windows it should be > 0 if the port is bluetooth over serial
@@ -243,19 +237,8 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
         # or hwid: BTHENUM\{00001101-0000-1000-8000-00805F9B34FB}_VID&00010397_PID&0002\8&1748680D&0&A8E2C19C9760_C0000000)
         return 0
 
-    def _infer_write_block_delay(self):
-        if self._submit_mode in (PASTE_SUBMIT_MODE, RAW_PASTE_SUBMIT_MODE):
-            return 0
-        elif self._connected_over_webrepl():
-            # ESP-32 needs long delay to work reliably over raw mode WebREPL
-            # https://github.com/micropython/micropython/issues/2497
-            # TODO: consider removing when this gets fixed
-            return 0.5
-        else:
-            return 0.01
-
     def _process_until_initial_prompt(self, interrupt: bool, clean: bool) -> None:
-        logger.debug("_process_until_initial_prompt, clean=%s", clean)
+        logger.info("_process_until_initial_prompt, clean=%s", clean)
 
         poke_after = 0.05
         if interrupt:
@@ -331,7 +314,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
 
         now = self._get_time_for_rtc()
 
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             return
         elif self._connected_to_circuitpython():
             if "rtc" not in self._builtin_modules:
@@ -390,7 +373,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             print("WARNING: Could not sync device's clock: " + val)
 
     def _get_utc_timetuple_from_device(self) -> Union[tuple, str]:
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             return "This device does not have a real-time clock"
         elif self._connected_to_circuitpython():
             specific_script = dedent(
@@ -452,7 +435,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
         return self._evaluate(script)
 
     def _update_cwd(self):
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             self._cwd = ""
         else:
             super()._update_cwd()
@@ -468,7 +451,8 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             W600_FIRST_RAW_PROMPT,
         ]:
             return
-        logger.debug("requesting raw mode at %r", self._last_prompt)
+
+        logger.info("Requesting raw mode at %r", self._last_prompt)
 
         # assuming we are currently on a normal prompt
         self._write(RAW_MODE_CMD)
@@ -487,12 +471,14 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
                 self._last_prompt,
             )
             raise ProtocolError("Could not enter raw prompt")
+        else:
+            logger.info("Entered raw prompt")
 
     def _ensure_normal_mode(self, force=False):
         if self._last_prompt == NORMAL_PROMPT and not force:
             return
 
-        logger.debug("requesting normal mode at %r", self._last_prompt)
+        logger.info("Requesting normal mode at %r", self._last_prompt)
         self._write(NORMAL_MODE_CMD)
         self._log_output_until_active_prompt()
         assert self._last_prompt == NORMAL_PROMPT, (
@@ -501,17 +487,20 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
 
     def _clear_repl(self):
         """NB! assumes prompt and may be called without __thonny_helper"""
-        logger.debug("_create_fresh_repl")
+        logger.info("_create_fresh_repl")
         self._ensure_raw_mode()
         self._write(SOFT_REBOOT_CMD)
+        assuming_ok = self._connection.soft_read(2, timeout=0.1)
+        if assuming_ok != OK:
+            logger.warning("Got %r after requesting soft reboot")
         self._check_reconnect()
-        self._log_output_until_active_prompt()
-        logger.debug("Done _create_fresh_repl")
+        self._forward_output_until_active_prompt()
+        logger.info("Done _create_fresh_repl")
 
     def _soft_reboot_for_restarting_user_program(self):
         # Need to go to normal mode. MP doesn't run user code in raw mode
         # (CP does, but it doesn't hurt to do it there as well)
-        logger.debug("_soft_reboot_for_restarting_user_program")
+        logger.info("_soft_reboot_for_restarting_user_program")
         self._ensure_normal_mode()
         self._write(SOFT_REBOOT_CMD)
         self._check_reconnect()
@@ -539,7 +528,8 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
         self._forward_unexpected_output()
 
         to_be_sent = script.encode("UTF-8")
-        logger.debug("Submitting via %s: %r", self._submit_mode, to_be_sent[:70])
+        log_sample_size = 1024 if logger.isEnabledFor(logging.DEBUG) else 256
+        logger.info("Submitting via %s: %r", self._submit_mode, to_be_sent[:log_sample_size])
         with self._interrupt_lock:
             if self._submit_mode == PASTE_SUBMIT_MODE:
                 self._submit_code_via_paste_mode(to_be_sent)
@@ -547,10 +537,13 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
                 try:
                     self._submit_code_via_raw_paste_mode(to_be_sent)
                 except RawPasteNotSupportedError:
-                    logger.info("WARNING: Could not use expected raw paste, falling back to raw")
-                    self._submit_code_via_raw_mode(
-                        to_be_sent, self._infer_write_block_size(), self._infer_write_block_delay()
+                    print("This device does not support raw-paste mode.", file=sys.stderr)
+                    print(
+                        "Please select different mode in 'Tools => Options => Interpreter => Advanced'.",
+                        file=sys.stderr,
                     )
+                    logger.error("Could not use raw_paste, exiting")
+                    exit(1)
             else:
                 self._submit_code_via_raw_mode(to_be_sent)
 
@@ -596,15 +589,8 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             actual_confirmation,
         )
 
-    def _submit_code_via_raw_mode(
-        self,
-        script_bytes: bytes,
-        block_size: Optional[int] = None,
-        block_delay: Optional[float] = None,
-    ) -> None:
+    def _submit_code_via_raw_mode(self, script_bytes: bytes) -> None:
         self._ensure_raw_mode()
-        block_size = block_size or self._write_block_size
-        block_delay = block_delay or self._write_block_delay
         to_be_written = script_bytes + EOT
 
         while to_be_written:
@@ -631,22 +617,43 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
     def _submit_code_via_raw_paste_mode(self, script_bytes: bytes) -> None:
         self._ensure_raw_mode()
         self._connection.set_text_mode(False)
-        self._write(RAW_PASTE_COMMAND)
-        response = self._connection.soft_read(2, timeout=WAIT_OR_CRASH_TIMEOUT)
-        if response != RAW_PASTE_CONFIRMATION:
-            # Occasionally, the device initially supports raw paste but later doesn't allow it
-            # https://github.com/thonny/thonny/issues/1545
-            time.sleep(0.01)
-            response += self._connection.read_all()
-            if response == FIRST_RAW_PROMPT:
-                self._last_prompt = FIRST_RAW_PROMPT
-                raise RawPasteNotSupportedError()
-            else:
-                logger.error("Got %r instead of raw-paste confirmation", response)
-                raise ProtocolError("Could not get raw-paste confirmation")
+        try:
+            # I've seen the situation where the device can do raw-paste, but it doesn't work for some commands
+            # (e.g. after doing "import webrepl_setup" with Pico and MP 1.22.2)
+            # This may mean we mistakenly thought we started in raw mode (e.g. because the program presented
+            # a prompt, which looks like raw prompt).
+            # Because of this, it's worth trying again in certain case (see below).
+            for i in range(2):
+                if i > 0:
+                    logger.info("Trying raw-paste again")
 
-        self._raw_paste_write(script_bytes)
-        self._connection.set_text_mode(True)
+                self._write(RAW_PASTE_COMMAND)
+                response = self._connection.soft_read(2, timeout=WAIT_OR_CRASH_TIMEOUT)
+                if response == RAW_PASTE_CONFIRMATION:
+                    self._raw_paste_write(script_bytes)
+                    return
+                elif response == RAW_PASTE_REFUSAL:
+                    # clear refusal, no point in trying again
+                    logger.info("Device refused raw paste")
+                    raise RawPasteNotSupportedError()
+                else:
+                    logger.info("Got %r instead of raw-paste confirmation.", response)
+                    # perhaps the device doesn't understand raw paste ...
+                    response += self._connection.soft_read_until(FIRST_RAW_PROMPT, timeout=0.5)
+                    if response.endswith(FIRST_RAW_PROMPT):
+                        self._last_prompt = FIRST_RAW_PROMPT
+                        if i == 0:
+                            # not sure yet, maybe we were not in raw mode when we started. Let's try once again
+                            continue
+                        else:
+                            # still no luck, so let's say it out:
+                            raise RawPasteNotSupportedError()
+                    else:
+                        logger.error("Got %r instead of raw-paste confirmation", response)
+                        raise ProtocolError("Could not get raw-paste confirmation")
+
+        finally:
+            self._connection.set_text_mode(True)
 
     def _raw_paste_write(self, command_bytes):
         # Adapted from https://github.com/micropython/micropython/commit/a59282b9bfb6928cd68b696258c0dd2280244eb3#diff-cf10d3c1fe676599a983c0ec85b78c56c9a6f21b2d896c69b3e13f34d454153e
@@ -657,6 +664,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             data + self._connection.read_all()
         )
         window_size = data[0] | data[1] << 8
+        logger.debug("Raw paste window size: %r", window_size)
         window_remain = window_size
 
         # Write out the command_bytes data.
@@ -671,18 +679,19 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
                     # Device indicated abrupt end, most likely a syntax error.
                     # Acknowledge it and finish.
                     self._write(b"\x04")
-                    logger.debug(
+                    logger.warning(
                         "Abrupt end of raw paste submit after submitting %s bytes out of %s",
                         i,
                         len(command_bytes),
                     )
-                    return
+                    raise ProtocolError("Abrupt end during raw paste")
                 else:
                     # Unexpected data from device.
                     logger.error("Unexpected read during raw paste: %r", data)
                     raise ProtocolError("Unexpected read during raw paste")
             # Send out as much data as possible that fits within the allowed window.
             b = command_bytes[i : min(i + window_remain, len(command_bytes))]
+            logger.debug("Writing %r bytes", len(b))
             self._write(b)
             window_remain -= len(b)
             i += len(b)
@@ -904,6 +913,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
                     follow_up = b""
 
                 if follow_up:
+                    logger.info("Found inactive prompt followed by %r", follow_up)
                     # Nope, the prompt is not active.
                     # (Actually it may be that a background thread has produced this follow up,
                     # but this would be too hard to consider.)
@@ -923,7 +933,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
                             break
                     output_consumer(self._decode(pending), stream_name)
                     self._last_prompt = current_prompt
-                    # logger.debug("Found prompt %r", current_prompt)
+                    logger.debug("Found prompt %r", current_prompt)
                     return current_prompt
 
             if pending.endswith(LF):
@@ -988,6 +998,13 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             collect_output, interrupt_times=interrupt_times, poke_after=poke_after
         )
 
+    def _forward_output_until_active_prompt(
+        self, interrupt_times: Optional[List[float]] = None, poke_after: Optional[float] = None
+    ) -> None:
+        self._process_output_until_active_prompt(
+            self._send_output, interrupt_times=interrupt_times, poke_after=poke_after
+        )
+
     def _forward_unexpected_output(self, stream_name="stdout"):
         "Invoked between commands"
         # TODO: This should be as careful as _forward_output_until_active_prompt
@@ -1033,6 +1050,22 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             else:
                 source = cmd.source
 
+            if cmd.get("populate_argv", False):
+                # Let the program know that it runs via %Run
+                assert isinstance(cmd.args, list)
+                argv = cmd.args
+                argv_updater = textwrap.dedent(
+                    f"""
+                try:
+                    import sys as _thonny_sys
+                    _thonny_sys.argv[:] = {argv}
+                    del __thonny_sys
+                except:
+                    pass
+                """
+                ).strip()
+                self._execute(argv_updater, capture_output=False)
+
             self._execute(source, capture_output=False)
             if restart_interpreter_before_run:
                 self._prepare_after_soft_reboot(False)
@@ -1044,7 +1077,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
         return {"returncode": returncode}
 
     def _cmd_get_fs_info(self, cmd):
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             used = self._evaluate(
                 dedent(
                     """
@@ -1162,7 +1195,6 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
     def _read_file_via_serial(
         self, source_path: str, target_fp: BinaryIO, callback: Callable[[int, int], None]
     ) -> None:
-
         hex_mode = self._should_hexlify(source_path)
 
         self._execute_without_output(
@@ -1344,7 +1376,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
             """
                 )
             )
-        elif self._using_microbit_micropython():
+        elif self._using_simplified_micropython():
             # doesn't have neither BytesIO.flush, nor os.sync
             self._execute_without_output(
                 dedent(
@@ -1629,7 +1661,7 @@ class BareMetalMicroPythonBackend(MicroPythonBackend, UploadDownloadMixin):
     def _get_file_operation_block_size(self):
         # don't forget that the size may be expanded up to 4x where converted to Python
         # bytes literal
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             return 512
         else:
             return 1024
@@ -1695,6 +1727,7 @@ class RawPasteNotSupportedError(RuntimeError):
 
 def launch_bare_metal_backend(backend_class: Callable[..., BareMetalMicroPythonBackend]) -> None:
     thonny.configure_backend_logging()
+    print(PROCESS_ACK)
 
     import ast
 

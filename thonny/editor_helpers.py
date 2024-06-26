@@ -27,6 +27,7 @@ class EditorInfoBox(tk.Toplevel):
         self._target_text_widget: Optional[SyntaxText] = None
 
         get_workbench().bind("<FocusOut>", self._workbench_focus_out, True)
+        get_workbench().get_editor_notebook().bind("<<NotebookTabChanged>>", self.hide, True)
 
         # If the box has received focus, then it may lose it by a messagebox
         # or mouse click on the main window
@@ -279,7 +280,6 @@ class DocuBoxBase(EditorInfoBox):
             self._append_chars(sig.return_type, ["annotation"])
 
     def render_parameter(self, param: SignatureParameter, active: bool) -> None:
-
         if active:
             base_tags = ["active"]
         else:
@@ -355,7 +355,7 @@ def get_text_filename(text: SyntaxText) -> Optional[str]:
     if isinstance(text, ShellText):
         return "<Shell>"
     elif isinstance(text, CodeViewText):
-        editor = getattr(text.master, "home_widget")
+        editor = text.master.master
         if isinstance(editor, Editor):
             return editor.get_filename()
 

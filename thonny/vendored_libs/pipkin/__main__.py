@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
 MIT License
 
-Copyright (c) 2022 Aivar Annamaa
+Copyright (c) 2024 Aivar Annamaa
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -22,11 +21,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
+
 import logging
-import subprocess
 import sys
-import textwrap
-from typing import List, Optional
 
 from pipkin import main
 

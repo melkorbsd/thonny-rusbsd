@@ -59,6 +59,7 @@ from thonny.common import (
     OBJECT_LINK_START,
     BackendEvent,
     CommandToBackend,
+    CompletionInfo,
     DistInfo,
     EOFCommand,
     ImmediateCommand,
@@ -113,11 +114,6 @@ logger = getLogger(__name__)
 
 class MicroPythonBackend(MainBackend, ABC):
     def __init__(self, clean, args):
-        # Make pipkin available
-        sys.path.insert(
-            0,
-            os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "vendored_libs")),
-        )
         logger.info("Initializing MicroPythonBackend of type %s", type(self).__name__)
         self._connection: MicroPythonConnection
         self._args = args
@@ -130,8 +126,6 @@ class MicroPythonBackend(MainBackend, ABC):
         self._epoch_year = None
         self._builtin_modules = []
         self._number_of_interrupts_sent = 0
-
-        self._builtins_info = self._fetch_builtins_info()
 
         MainBackend.__init__(self)
         try:
@@ -171,6 +165,8 @@ class MicroPythonBackend(MainBackend, ABC):
         logger.debug("Helper code:\n%s", script)
         self._check_perform_just_in_case_gc()
         self._execute_without_output(script)
+
+        # See https://github.com/thonny/thonny/issues/1877
         # self._execute_without_output(
         #     dedent(
         #         """
@@ -180,6 +176,7 @@ class MicroPythonBackend(MainBackend, ABC):
         #     """
         #     ).strip()
         # )
+
         report_time("prepared helpers")
 
         self._update_cwd()
@@ -199,7 +196,7 @@ class MicroPythonBackend(MainBackend, ABC):
             self._validate_time()
 
     def _check_perform_just_in_case_gc(self):
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             # May fail to allocate memory without this
             self._perform_gc()
 
@@ -345,6 +342,8 @@ class MicroPythonBackend(MainBackend, ABC):
 
         if "local_cwd" in cmd:
             self._local_cwd = cmd["local_cwd"]
+            if os.path.isdir(self._local_cwd):
+                os.chdir(self._local_cwd)
 
         super()._handle_normal_command(cmd)
 
@@ -354,12 +353,14 @@ class MicroPythonBackend(MainBackend, ABC):
     def _check_for_connection_error(self) -> None:
         self.get_connection().check_for_error()
 
-    def _using_microbit_micropython(self):
+    def _using_simplified_micropython(self):
         if not self._welcome_text:
             return None
 
         # Don't confuse MicroPython and CircuitPython
-        return "micro:bit" in self._welcome_text.lower() and "MicroPython" in self._welcome_text
+        return (
+            "micro:bit" in self._welcome_text.lower() or "calliope" in self._welcome_text.lower()
+        ) and "MicroPython" in self._welcome_text
 
     def _connected_to_pyboard(self):
         if not self._welcome_text:
@@ -394,17 +395,8 @@ class MicroPythonBackend(MainBackend, ABC):
         else:
             return self._evaluate("__thonny_helper.sys.path")
 
-    def _fetch_builtins_info(self):
-        for stubs_dir in self._get_sys_path_for_analysis():
-            for name in ["builtins.py", "builtins.pyi"]:
-                path = os.path.join(stubs_dir, name)
-                if os.path.exists(path):
-                    return parse_api_information(path)
-
-        return {}
-
     def _fetch_epoch_year(self):
-        if self._using_microbit_micropython():
+        if self._using_simplified_micropython():
             return None
 
         if self._connected_to_circuitpython() and "rtc" not in self._builtin_modules:
@@ -444,7 +436,7 @@ class MicroPythonBackend(MainBackend, ABC):
             return result
 
     def _update_cwd(self):
-        if not self._using_microbit_micropython():
+        if not self._using_simplified_micropython():
             logger.debug("Updating cwd")
             self._cwd = self._evaluate("__thonny_helper.getcwd()")
 
@@ -719,6 +711,75 @@ class MicroPythonBackend(MainBackend, ABC):
 
         return {"id": cmd.object_id, "info": info}
 
+    def _cmd_shell_autocomplete(self, cmd):
+        source = cmd.source
+        response = dict(source=cmd.source, row=cmd.row, column=cmd.column, completions=[])
+        completions_by_name = {}
+
+        # First the dynamic completions
+        match = re.search(
+            r"(\w+\.)*(\w+)?$", source
+        )  # https://github.com/takluyver/ubit_kernel/blob/master/ubit_kernel/kernel.py
+        if match:
+            prefix = match.group()
+            if "." in prefix:
+                obj, prefix = prefix.rsplit(".", 1)
+                names = self._evaluate(
+                    "__thonny_helper.builtins.dir({obj}) if '{obj}' in __thonny_helper.builtins.locals() or '{obj}' in __thonny_helper.builtins.globals() else []".format(
+                        obj=obj
+                    )
+                )
+            else:
+                names = self._evaluate("__thonny_helper.builtins.dir()")
+        else:
+            names = []
+            prefix = ""
+
+        # prevent TypeError (iterating over None)
+        names = names if names else []
+
+        for name in names:
+            if name.startswith(prefix) and not name.startswith("__"):
+                completions_by_name[name] = self._create_shell_completion(name, prefix)
+
+        # add keywords, import modules etc. from jedi (possibly overriding dynamic names)
+        try:
+            from thonny import jedi_utils
+
+            # at the moment I'm assuming source is the code before cursor, not whole input
+            lines = source.split("\n")
+            jedi_completions = jedi_utils.get_script_completions(
+                source,
+                len(lines),
+                len(lines[-1]),
+                "<shell>",
+                sys_path=self._get_sys_path_for_analysis(),
+            )
+            for comp in jedi_completions:
+                if (
+                    comp.type in ["module", "keyword"] or comp.module_name == "builtins"
+                ) and self._should_present_static_completion(comp):
+                    completions_by_name[comp.name] = comp
+
+        except Exception as e:
+            logger.exception("Problem with jedi shell autocomplete")
+
+        response["completions"] = list(completions_by_name.values())
+        return response
+
+    def _create_shell_completion(self, name: str, prefix: str) -> CompletionInfo:
+        return CompletionInfo(
+            name=name,
+            name_with_symbols=name,
+            full_name=name,
+            type="name",
+            prefix_length=len(prefix),
+            signatures=None,  # must be queried separately
+            docstring=None,  # must be queried separately
+            module_path=None,
+            module_name=None,
+        )
+
     def _find_basic_object_info(self, object_id, context_id):
         """If object is found then returns basic info and leaves object reference
         to __thonny_helper.object_info.
@@ -879,10 +940,17 @@ class MicroPythonBackend(MainBackend, ABC):
             user = False
 
         if "--upgrade" in args:
-            update = True
+            upgrade = True
             args.remove("--upgrade")
         else:
-            update = False
+            upgrade = False
+
+        if "--progress-bar" in args:
+            # Pipkin doesn't support it
+            pos = args.index("--progress-bar")
+            assert args[pos + 1] in ["on", "off"]
+            del args[pos + 1]
+            del args[pos]
 
         if "-r" in args:
             pos = args.index("-r")
@@ -901,7 +969,7 @@ class MicroPythonBackend(MainBackend, ABC):
                 command="install",
                 specs=specs,
                 user=user,
-                update=update,
+                upgrade=upgrade,
                 requirement_files=requirement_files,
             )
         except Exception as e:
@@ -936,8 +1004,7 @@ class MicroPythonBackend(MainBackend, ABC):
         self._execute_without_output("__thonny_helper.os.mkdir(%r)" % path)
 
     @abstractmethod
-    def _create_pipkin_adapter(self):
-        ...
+    def _create_pipkin_adapter(self): ...
 
     def _perform_pipkin_operation_and_list(self, command: Optional[str], **kwargs) -> Set[DistInfo]:
         import pipkin.common
@@ -1028,28 +1095,28 @@ class MicroPythonBackend(MainBackend, ABC):
         assert not cmd.path.startswith("//")
         self._mkdir(cmd.path)
 
-    def _filter_completions(self, completions):
-        # filter out completions not applicable to MicroPython
-        result = []
-        for completion in completions:
-            if completion.name.startswith("__"):
-                continue
+    def _should_present_static_completion(self, completion: CompletionInfo) -> bool:
+        if completion.name.startswith("__"):
+            return False
 
-            if completion.parent() and completion.full_name:
-                parent_name = completion.parent().name
-                name = completion.name
-                root = completion.full_name.split(".")[0]
+        if completion.module_path is None and completion.type == "module":
+            # That's how jedi 0.18 (and maybe later) lists CPython stdlib modules
+            return False
 
-                # jedi proposes names from CPython builtins
-                if root in self._builtins_info and name not in self._builtins_info[root]:
-                    continue
+        if completion.module_name == "builtins":
+            # Jedi's builtins.pyi is pretty good
+            return True
 
-                if parent_name == "builtins" and name not in self._builtins_info:
-                    continue
+        if completion.module_path:
+            # if it's in our stubs folder, then it's good
+            for path in self._get_sys_path_for_analysis():
+                if os.path.normcase(completion.module_path).startswith(os.path.normcase(path)):
+                    return True
 
-            result.append({"name": completion.name})
+            # somewhere else, not good
+            return False
 
-        return result
+        return True
 
     def _get_sys_path_for_analysis(self) -> Optional[List[str]]:
         return [os.path.join(os.path.dirname(__file__), "base_api_stubs")]
@@ -1253,12 +1320,7 @@ class MicroPythonBackend(MainBackend, ABC):
             return source
 
     def _mark_nodes_to_be_guarded_from_instrumentation(self, node, guarded_context):
-        if (
-            not guarded_context
-            and isinstance(node, ast.FunctionDef)
-            and node.decorator_list
-            and any(self._is_asm_pio_decorator(decorator) for decorator in node.decorator_list)
-        ):
+        if not guarded_context and isinstance(node, ast.FunctionDef):
             guarded_context = True
 
         node.guarded = guarded_context
@@ -1319,8 +1381,8 @@ class MicroPythonBackend(MainBackend, ABC):
 
         result = {
             "kind": kind,
-            "size": size,
-            "modified": modified,
+            "size_bytes": size,
+            "modified_epoch": modified,
             "hidden": basename.startswith("."),
         }
         if error:
@@ -1349,34 +1411,6 @@ class ManagementError(ProtocolError):
         self.script = script
         self.out = out
         self.err = err
-
-
-def parse_api_information(file_path):
-    import tokenize
-
-    with tokenize.open(file_path) as fp:
-        source = fp.read()
-
-    tree = ast.parse(source)
-
-    defs = {}
-
-    # TODO: read also docstrings ?
-
-    for toplevel_item in tree.body:
-        if isinstance(toplevel_item, ast.ClassDef):
-            class_name = toplevel_item.name
-            member_names = []
-            for item in toplevel_item.body:
-                if isinstance(item, ast.FunctionDef):
-                    member_names.append(item.name)
-                elif isinstance(item, ast.Assign):
-                    # TODO: check Python 3.4
-                    "TODO: item.targets[0].id"
-
-            defs[class_name] = member_names
-
-    return defs
 
 
 def unix_dirname_basename(path):

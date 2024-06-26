@@ -7,12 +7,11 @@ import ast
 import os.path
 import tkinter as tk
 import tokenize
+from _tkinter import TclError
 from logging import getLogger
 from tkinter import ttk
 from tkinter.messagebox import showinfo
 from typing import List, Union  # @UnusedImport
-
-from _tkinter import TclError
 
 from thonny import (
     ast_utils,
@@ -26,6 +25,7 @@ from thonny import (
 )
 from thonny.codeview import CodeView, SyntaxText, get_syntax_options_for_tag
 from thonny.common import DebuggerCommand, InlineCommand
+from thonny.custom_notebook import CustomNotebook
 from thonny.languages import tr
 from thonny.memory import VariablesFrame
 from thonny.misc_utils import running_on_mac_os, running_on_rpi, shorten_repr
@@ -227,9 +227,11 @@ class SingleWindowDebugger(Debugger):
                 frame_info.locals,
                 frame_info.globals,
                 frame_info.freevars,
-                frame_info.module_name
-                if frame_info.code_name == "<module>"
-                else frame_info.code_name,
+                (
+                    frame_info.module_name
+                    if frame_info.code_name == "<module>"
+                    else frame_info.code_name
+                ),
             )
 
     def handle_debugger_return(self, msg):
@@ -354,9 +356,13 @@ class FrameVisualizer:
         self._frame_id = frame_info.id
         self._filename = frame_info.filename
         self._firstlineno = None
-        if running_on_mac_os():
+        if running_on_mac_os() and get_tk_version_info() < (8, 6, 11):
+            # Older Tk versions had glitch with placement of the expression box
+            # (closed box was not cleaned up)
             self._expression_box = ToplevelExpressionBox(text_frame)
         else:
+            # since 8.6.11 Tk on macOS has glitch with ToplevelExpressionBox
+            # (bad z-index)
             self._expression_box = PlacedExpressionBox(text_frame)
 
         self._note_box = ui_utils.NoteBox(text_frame.winfo_toplevel())
@@ -641,7 +647,6 @@ class BaseExpressionBox:
         event = frame_info.event
 
         if frame_info.current_root_expression is not None:
-
             if self._last_root_expression != frame_info.current_root_expression:
                 # can happen, eg. when focus jumps from the last expr in while body
                 # to while test expression
@@ -949,18 +954,17 @@ class DialogVisualizer(CommonDialog, FrameVisualizer):
         self.main_frame.grid(sticky=tk.NSEW)
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-        self.main_pw = ui_utils.AutomaticPanedWindow(self.main_frame, orient=tk.VERTICAL)
+        self.main_pw = ui_utils.WorkbenchPanedWindow(self.main_frame, orient=tk.VERTICAL)
         self.main_pw.grid(sticky=tk.NSEW, padx=10, pady=10)
         self.main_frame.rowconfigure(0, weight=1)
         self.main_frame.columnconfigure(0, weight=1)
 
-        self._code_book = ttk.Notebook(self.main_pw)
+        self._code_book = CustomNotebook(self.main_pw, closable=False)
         self._text_frame = CodeView(
             self._code_book, first_line_number=frame_info.firstlineno, font="EditorFont"
         )
         self._code_book.add(self._text_frame, text=tr("Source code"))
-        self.main_pw.add(self._code_book, minsize=200)
-        self._code_book.preferred_size_in_pw = 400
+        self.main_pw.add(self._code_book, minsize=200, height=400)
 
     def _load_code(self, frame_info):
         self._text_frame.set_content(frame_info.source)
@@ -997,11 +1001,10 @@ class FunctionCallDialog(DialogVisualizer):
 
     def _init_layout_widgets(self, master, frame_info):
         DialogVisualizer._init_layout_widgets(self, master, frame_info)
-        self._locals_book = ttk.Notebook(self.main_pw)
+        self._locals_book = CustomNotebook(self.main_pw, closable=False)
         self._locals_frame = VariablesFrame(self._locals_book)
-        self._locals_book.preferred_size_in_pw = 200
         self._locals_book.add(self._locals_frame, text=tr("Local variables"))
-        self.main_pw.add(self._locals_book, minsize=100)
+        self.main_pw.add(self._locals_book, minsize=100, height=200)
 
     def _load_code(self, frame_info):
         DialogVisualizer._load_code(self, frame_info)
@@ -1124,7 +1127,6 @@ class ExceptionView(TextFrame):
 
         self.text.configure(foreground=get_syntax_options_for_tag("stderr")["foreground"])
         for line, frame_id, filename, lineno in exception_lines_with_frame_info:
-
             if frame_id is not None:
                 frame_tag = "frame_%d" % frame_id
 
@@ -1278,7 +1280,6 @@ def run_preferred_debug_command():
 
 
 def load_plugin() -> None:
-
     global RESUME_COMMAND_CAPTION
     RESUME_COMMAND_CAPTION = tr("Resume")
 

@@ -2,7 +2,7 @@
 import ast
 import builtins
 import functools
-import importlib
+import importlib.util
 import inspect
 import io
 import os.path
@@ -43,25 +43,28 @@ from thonny.common import (
     ValueInfo,
     execute_system_command,
     execute_with_frontend_sys_path,
+    export_installed_distributions_info,
     get_augmented_system_path,
+    get_base_executable,
     get_exe_dirs,
     get_python_version_string,
     get_single_dir_child_data,
     path_startswith,
+    running_in_virtual_environment,
     serialize_message,
     update_system_path,
 )
 
 _REPL_HELPER_NAME = "_thonny_repl_print"
 
-_CONFIG_FILENAME = os.path.join(thonny.THONNY_USER_DIR, "backend_configuration.ini")
+_CONFIG_FILENAME = os.path.join(thonny.get_thonny_user_dir(), "backend_configuration.ini")
 
 
 _backend = None
 
 
 class MainCPythonBackend(MainBackend):
-    def __init__(self, target_cwd):
+    def __init__(self, target_cwd, options):
         report_time("Before MainBackend")
         MainBackend.__init__(self)
         report_time("After MainBackend")
@@ -70,7 +73,9 @@ class MainCPythonBackend(MainBackend):
         _backend = self
 
         self._ini = None
+        self._options = options
         self._object_info_tweakers = []
+        self._warned_shadow_casters = set()
         self._import_handlers = {}
         self._input_queue = queue.Queue()
         self._source_preprocessors = []
@@ -102,8 +107,10 @@ class MainCPythonBackend(MainBackend):
         report_time("Before loading plugins")
         execute_with_frontend_sys_path(self._load_plugins)
         report_time("After loading plugins")
+        if self._options.get("run.warn_module_shadowing", False):
+            sys.addaudithook(self.import_audit_hook)
 
-        # preceding code was run in the directory containing thonny module, now switch to provided
+        # preceding code was run in an empty directory, now switch to provided
         try:
             os.chdir(os.path.expanduser(target_cwd))
         except OSError:
@@ -115,8 +122,10 @@ class MainCPythonBackend(MainBackend):
         # ... and replace current-dir path item
         # start in shell mode (may be later switched to script mode)
         # required in shell mode and also required to overwrite thonny location dir
-        sys.path[0] = ""
+        assert "" not in sys.path  # for avoiding
+        sys.path.insert(0, "")
         sys.argv[:] = [""]  # empty "script name"
+        self._check_warn_avoided_sys_path_conflicts()
 
         if os.name == "nt":
             self._install_signal_handler()
@@ -160,6 +169,86 @@ class MainCPythonBackend(MainBackend):
 
     def get_main_module(self):
         return __main__
+
+    def import_audit_hook(self, event: str, args):
+        if event == "import":
+            logger.debug("detected Import event with args %r", args)
+            module_name = args[0]
+            self._check_warn_sys_path_conflict(module_name.split(".")[0])
+
+    def _check_warn_avoided_sys_path_conflicts(self):
+        if not self._options.get("run.warn_module_shadowing", False):
+            return
+
+        for name in sys.modules.keys():
+            if name != "__main__":
+                self._check_warn_sys_path_conflict(name.split(".")[0])
+
+    def _check_warn_sys_path_conflict(self, root_module_name: str):
+        user_dir = sys.path[0]
+        if user_dir == "":
+            user_dir = os.getcwd()
+
+        # rough test to see if it's worth invoking the finder
+        for ext in ["", ".py", ".pyw"]:
+            pot_path = os.path.join(user_dir, root_module_name + ext)
+            if os.path.exists(pot_path):
+                logger.debug("Found import candidate: %r", pot_path)
+                break
+        else:
+            return
+
+        # It looks like a module is importable from the script dir or current dir.
+        # Is it shadowing a library module?
+
+        current_spec = self._find_spec_ignore_loaded(root_module_name)
+
+        first_entry = sys.path[0]
+        del sys.path[0]
+        try:
+            shadowed_spec = self._find_spec_ignore_loaded(root_module_name)
+        finally:
+            sys.path.insert(0, first_entry)
+
+        if shadowed_spec is None:
+            logger.debug("No shadowed spec")
+            return
+
+        if shadowed_spec.origin == current_spec.origin:
+            logger.debug("Equal current and shadowed spec")
+            return
+
+        logger.debug("%r shadows %r", current_spec.origin, shadowed_spec.origin)
+
+        if current_spec.origin in self._warned_shadow_casters:
+            return
+
+        if root_module_name in sys.modules:
+            # i.e. the method is called for post-import warning
+            verb = "can shadow"
+        else:
+            verb = "is shadowing"
+
+        self._send_output(
+            # NB! Using backticks, because Shell would present file path in quotes as frame link
+            f"WARNING: Your `{current_spec.origin}` {verb} the library module '{root_module_name}'. Consider renaming or moving it!\n\n",
+            "stderr",
+        )
+
+        self._warned_shadow_casters.add(current_spec.origin)
+
+    def _find_spec_ignore_loaded(self, module_name):
+        if module_name not in sys.modules:
+            return importlib.util.find_spec(module_name)
+
+        old_modules = sys.modules
+        try:
+            modules_copy = old_modules.copy()
+            del modules_copy[module_name]
+            sys.modules = modules_copy
+            return importlib.util.find_spec(module_name)
+        finally:
+            sys.modules = old_modules
 
     def _read_incoming_msg_line(self) -> str:
         return self._original_stdin.readline()
@@ -256,8 +345,11 @@ class MainCPythonBackend(MainBackend):
 
         filename = cmd.args[0]
         if os.path.isfile(filename):
-            sys.path.insert(0, os.path.abspath(os.path.dirname(filename)))
-            __main__.__dict__["__file__"] = filename
+            abs_filename = os.path.abspath(filename)
+            sys.path.insert(0, os.path.dirname(abs_filename))
+            __main__.__dict__["__file__"] = abs_filename
+
+        self._check_warn_avoided_sys_path_conflicts()
 
     def _custom_import(self, *args, **kw):
         module = self._original_import(*args, **kw)
@@ -329,16 +421,13 @@ class MainCPythonBackend(MainBackend):
             main_dir=self._main_dir,
             sys_path=sys.path,
             usersitepackages=site.getusersitepackages() if site.ENABLE_USER_SITE else None,
+            externally_managed=self._is_externally_managed(),
             prefix=sys.prefix,
             welcome_text=f"Python {get_python_version_string()} ({sys.executable})",
             executable=sys.executable,
+            base_executable=get_base_executable(),
             exe_dirs=get_exe_dirs(),
-            in_venv=(
-                hasattr(sys, "base_prefix")
-                and sys.base_prefix != sys.prefix
-                or hasattr(sys, "real_prefix")
-                and getattr(sys, "real_prefix") != sys.prefix
-            ),
+            in_venv=running_in_virtual_environment(),
             python_version=get_python_version_string(),
             cwd=os.getcwd(),
         )
@@ -477,7 +566,7 @@ class MainCPythonBackend(MainBackend):
 
     def _cmd_get_active_distributions(self, cmd):
         return dict(
-            distributions=self._get_distributions_info(),
+            distributions=export_installed_distributions_info(),
         )
 
     def _cmd_install_distributions(self, cmd):
@@ -527,7 +616,7 @@ class MainCPythonBackend(MainBackend):
                 .replace("<class '", "")
                 .replace("'>", "")
                 .strip(),
-                "attributes": self.export_variables(attributes),
+                "attributes": self.export_variables(attributes, all_variables=True),
             }
 
             if isinstance(value, io.TextIOWrapper):
@@ -579,50 +668,14 @@ class MainCPythonBackend(MainBackend):
             except Exception as e:
                 print("Could not delete %s: %s" % (path, str(e)), file=sys.stderr)
 
-    def _perform_pip_operation_and_list(
-        self, cmd_line: List[str]
-    ) -> Tuple[int, Dict[str, DistInfo]]:
-
+    def _perform_pip_operation_and_list(self, cmd_line: List[str]) -> Tuple[int, List[DistInfo]]:
         extra_switches = ["--disable-pip-version-check"]
         proxy = os.environ.get("https_proxy", os.environ.get("http_proxy", None))
         if proxy:
             extra_switches.append("--proxy=" + proxy)
 
         returncode = subprocess.call([sys.executable, "-m", "pip"] + extra_switches + cmd_line)
-        return returncode, self._get_distributions_info()
-
-    def _get_distributions_info(self) -> Dict[str, DistInfo]:
-        # Avoiding pip, because pip is slow.
-        # If it is called after first installation to user site packages
-        # this dir is not yet in sys.path
-        # This would be required also when using Python 3.8 and importlib.metadata.distributions()
-        if (
-            site.ENABLE_USER_SITE
-            and site.getusersitepackages()
-            and os.path.exists(site.getusersitepackages())
-            and site.getusersitepackages() not in sys.path
-        ):
-            # insert before first site packages item
-            for i, item in enumerate(sys.path):
-                if "site-packages" in item or "dist-packages" in item:
-                    sys.path.insert(i, site.getusersitepackages())
-                    break
-            else:
-                sys.path.append(site.getusersitepackages())
-
-        import pkg_resources
-
-        # TODO: consider using importlib.metadata.distributions()
-        pkg_resources._initialize_master_working_set()
-        return {
-            dist.key: DistInfo(
-                key=dist.key,
-                project_name=dist.project_name,
-                location=dist.location,
-                version=dist.version,
-            )
-            for dist in pkg_resources.working_set  # pylint: disable=not-an-iterable
-        }
+        return returncode, export_installed_distributions_info()
 
     def _get_sep(self) -> str:
         return os.path.sep
@@ -633,7 +686,6 @@ class MainCPythonBackend(MainBackend):
         return get_single_dir_child_data(path, include_hidden)
 
     def _get_path_info(self, path: str) -> Optional[Dict]:
-
         try:
             if not os.path.exists(path):
                 return None
@@ -645,16 +697,16 @@ class MainCPythonBackend(MainBackend):
             return {
                 "path": path,
                 "kind": kind,
-                "size": None if kind == "dir" else os.path.getsize(path),
-                "modified": os.path.getmtime(path),
+                "size_bytes": None if kind == "dir" else os.path.getsize(path),
+                "modified_epoch": os.path.getmtime(path),
                 "error": None,
             }
         except OSError as e:
             return {
                 "path": path,
                 "kind": None,
-                "size": None,
-                "modified": None,
+                "size_bytes": None,
+                "modified_epoch": None,
                 "error": str(e),
             }
 
@@ -846,12 +898,12 @@ class MainCPythonBackend(MainBackend):
 
         return ValueInfo(id(value), rep)
 
-    def export_variables(self, variables):
+    def export_variables(self, variables, all_variables=False):
         result = {}
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for name in variables:
-                if not name.startswith("__"):
+                if not name.startswith("__") or all_variables:
                     result[name] = self.export_value(variables[name], 100)
 
         return result
@@ -1000,6 +1052,22 @@ class MainCPythonBackend(MainBackend):
         if "tty_mode" in cmd:
             self._tty_mode = cmd["tty_mode"]
 
+    def _is_externally_managed(self):
+        if running_in_virtual_environment():
+            return False
+
+        import sysconfig
+
+        get_default_scheme = getattr(sysconfig, "get_default_scheme", None)
+        if get_default_scheme is None:
+            # before Python 3.10
+            get_default_scheme = getattr(sysconfig, "_get_default_scheme")
+
+        marker_path = os.path.join(
+            sysconfig.get_path("stdlib", get_default_scheme()), "EXTERNALLY-MANAGED"
+        )
+        return os.path.isfile(marker_path)
+
 
 class FakeStream:
     def __init__(self, backend: MainCPythonBackend, target_stream):
@@ -1034,6 +1102,8 @@ class FakeOutputStream(FakeStream):
         finally:
             self._backend._exit_io_function()
 
+        return len(data)
+
     def writelines(self, lines):
         try:
             self._backend._enter_io_function()
@@ -1049,6 +1119,7 @@ class FakeInputStream(FakeStream):
         self._eof = False
 
     def _generic_read(self, method, original_limit):
+        have_sent_input_request = False
         if original_limit is None:
             effective_limit = -1
         elif method == "readlines" and original_limit > -1:
@@ -1090,9 +1161,12 @@ class FakeInputStream(FakeStream):
                     break
 
                 else:
-                    self._backend.send_message(
-                        BackendEvent("InputRequest", method=method, limit=original_limit)
-                    )
+                    if not have_sent_input_request:
+                        self._backend.send_message(
+                            BackendEvent("InputRequest", method=method, limit=original_limit)
+                        )
+                        have_sent_input_request = True
+
                     msg = self._backend._fetch_next_incoming_message()
                     if isinstance(msg, InputSubmission):
                         self._buffer += msg.data
@@ -1217,13 +1291,13 @@ class Executor:
     def _instrument_repl_code(self, root):
         # modify all expression statements to print and register their non-None values
         for node in ast.walk(root):
-            if (
-                isinstance(node, ast.FunctionDef)
-                or hasattr(ast, "AsyncFunctionDef")
-                and isinstance(node, ast.AsyncFunctionDef)
-            ):
+            if isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
                 first_stmt = node.body[0]
-                if isinstance(first_stmt, ast.Expr) and isinstance(first_stmt.value, ast.Str):
+                if (
+                    isinstance(first_stmt, ast.Expr)
+                    and isinstance(first_stmt.value, ast.Constant)
+                    and isinstance(first_stmt.value.value, str)
+                ):
                     first_stmt.contains_docstring = True
             if isinstance(node, ast.Expr) and not getattr(node, "contains_docstring", False):
                 node.value = ast.Call(
@@ -1324,20 +1398,15 @@ def format_exception_with_frame_info(e_type, e_value, e_traceback, shorten_filen
                         or not isinstance(e_value, SyntaxError)
                     )
                 ):
-                    fmt = '  File "{}", line {}, in {}\n'.format(
-                        entry.filename, entry.lineno, entry.name
-                    )
-
-                    if entry.line:
-                        fmt += "    {}\n".format(entry.line.strip())
-
+                    fmt = "".join(traceback.format_list([entry]))
                     yield (fmt, id(tb_temp.tb_frame), entry.filename, entry.lineno)
 
                 tb_temp = tb_temp.tb_next
 
             assert tb_temp is None  # tb was exhausted
 
-        for line in traceback.format_exception_only(etype, value):
+        # using format_exception with limit instead of format_exception_only because latter doesn't give extended info
+        for line in traceback.format_exception(etype, value, tb, limit=0):
             if etype is SyntaxError and line.endswith("^\n"):
                 # for some reason it may add several empty lines before ^-line
                 partlines = line.splitlines()

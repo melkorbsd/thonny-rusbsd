@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 
+import datetime
 import os.path
 import platform
 import queue
@@ -8,11 +10,36 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Optional, Sequence, Tuple
+from logging import getLogger
+from typing import Any, List, Optional, Sequence
+
+from thonny.languages import tr
 
 PASSWORD_METHOD = "password"
 PUBLIC_KEY_NO_PASS_METHOD = "public-key (without passphrase)"
 PUBLIC_KEY_WITH_PASS_METHOD = "public-key (with passphrase)"
+
+logger = getLogger(__name__)
+
+
+def get_known_folder(ID):
+    # http://stackoverflow.com/a/3859336/261181
+    # https://tarma.com/support/im9/using/symbols/functions/csidls.htm
+    import ctypes.wintypes
+
+    SHGFP_TYPE_CURRENT = 0
+    buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
+    ctypes.windll.shell32.SHGetFolderPathW(0, ID, 0, SHGFP_TYPE_CURRENT, buf)
+    assert buf.value
+    return buf.value
+
+
+def get_roaming_appdata_dir():
+    return get_known_folder(26)
+
+
+def get_local_appdata_dir():
+    return get_known_folder(28)
 
 
 def delete_dir_try_hard(path: str, hardness: int = 5) -> None:
@@ -45,9 +72,13 @@ def running_on_linux() -> bool:
 
 
 def running_on_rpi() -> bool:
+    machine_lower = platform.uname().machine.lower()
     return running_on_linux() and (
-        platform.uname().machine.lower().startswith("arm")
+        # not great heuristics, I know
+        machine_lower.startswith("arm")
+        or machine_lower.startswith("aarch64")
         or os.environ.get("DESKTOP_SESSION") == "LXDE-pi"
+        or os.environ.get("DESKTOP_SESSION") == "LXDE-pi-wayfire"
     )
 
 
@@ -92,11 +123,31 @@ def list_volumes(skip_letters=set()) -> Sequence[str]:
             return volumes
         finally:
             ctypes.windll.kernel32.SetErrorMode(old_mode)  # @UndefinedVariable
+    if sys.platform == "linux":
+        try:
+            from dbus_next.errors import DBusError
+        except ImportError:
+            logger.info("Could not import dbus_next, falling back to mount command")
+            return list_volumes_with_mount_command()
+
+        from thonny.udisks import list_volumes_sync
+
+        try:
+            return list_volumes_sync()
+        except DBusError as error:
+            if "org.freedesktop.DBus.Error.ServiceUnknown" not in error.text:
+                raise
+            # Fallback to using the 'mount' command on Linux if the Udisks D-Bus service is unavailable.
+            return list_volumes_with_mount_command()
     else:
-        # 'posix' means we're on Linux or OSX (Mac).
+        # 'posix' means we're on *BSD or OSX (Mac).
         # Call the unix "mount" command to list the mounted volumes.
-        mount_output = subprocess.check_output("mount").splitlines()
-        return [x.split()[2].decode("utf-8") for x in mount_output]
+        return list_volumes_with_mount_command()
+
+
+def list_volumes_with_mount_command() -> Sequence[str]:
+    mount_output = subprocess.check_output("mount").splitlines()
+    return [x.split()[2].decode("utf-8") for x in mount_output]
 
 
 def get_win_volume_name(path: str) -> str:
@@ -514,3 +565,165 @@ def show_command_not_available_in_flatpak_message():
         tr("This command is not available if Thonny is run via Flatpak"),
         parent=get_workbench(),
     )
+
+
+def get_menu_char():
+    if running_on_windows():
+        return "≡"  # Identical to
+    else:
+        return "☰"  # Trigram for heaven, too heavy on Windows
+
+
+def download_bytes(url: str, timeout: int = 10) -> bytes:
+    from urllib.request import Request, urlopen
+
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            "Accept-Encoding": "gzip, deflate",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urlopen(req, timeout=timeout) as fp:
+        if fp.info().get("Content-Encoding") == "gzip":
+            import gzip
+
+            return gzip.decompress(fp.read())
+        else:
+            return fp.read()
+
+
+def download_and_parse_json(url: str, timeout: int = 10) -> Any:
+    import json
+
+    return json.loads(download_bytes(url, timeout=timeout))
+
+
+def get_os_level_favorite_folders() -> List[str]:
+    if running_on_windows():
+        raise NotImplementedError()
+
+    result = []
+    for name in [".", "Desktop", "Documents", "Downloads"]:
+        path = os.path.realpath(os.path.expanduser(f"~/{name}"))
+        if os.path.isdir(path):
+            result.append(path)
+
+    gtk_favorites_path = os.path.expanduser("~/.config/gtk-3.0/bookmarks")
+    if running_on_linux() and os.path.isfile(gtk_favorites_path):
+        with open(gtk_favorites_path, "rt", encoding="utf-8") as fp:
+            for line in fp:
+                if line.startswith("file:///"):
+                    path = line[7:].strip()
+                    if os.path.isdir(path) and path not in result:
+                        result.append(path)
+
+    return result
+
+
+def format_date_and_time_compact(
+    timestamp: time.struct_time, without_seconds: bool, optimize_year: bool = False
+):
+    return (
+        format_date_compact(timestamp, optimize_year=optimize_year)
+        + " • "
+        + format_time_compact(timestamp, without_seconds=without_seconds)
+    )
+
+
+def format_time_compact(timestamp: time.struct_time, without_seconds: bool):
+
+    # Useful with locale specific formats, which would be a hassle to construct from parts
+    s = time.strftime("%X", timestamp)
+    if without_seconds:
+        seconds_part = ":%02d" % (timestamp.tm_sec,)
+        seconds_index = s.rfind(seconds_part)
+        if seconds_index == -1:
+            return s
+
+        return s[:seconds_index] + s[seconds_index + len(seconds_part) :]
+    else:
+        return s
+
+
+def format_date_compact(timestamp: time.struct_time, optimize_year: bool = False):
+    # Useful with locale specific formats, which would be a hassle to construct from parts
+    now = time.localtime()
+    if (
+        timestamp.tm_year == now.tm_year
+        and timestamp.tm_mon == now.tm_mon
+        and timestamp.tm_mday == now.tm_mday
+    ):
+        return tr("Today")
+
+    result = time.strftime(get_date_format_with_month_abbrev(), timestamp)
+    age_in_days = (time.time() - time.mktime(timestamp)) / 60 / 60 / 24
+    if (
+        age_in_days < 0
+        or (now.tm_year != timestamp.tm_year and age_in_days > 10)
+        or age_in_days > 10
+    ):
+        result += " " + str(timestamp.tm_year)
+
+    return result
+
+
+_date_format_with_month_abbrev = None
+
+
+def get_date_format_with_month_abbrev() -> str:
+    global _date_format_with_month_abbrev
+    if _date_format_with_month_abbrev is None:
+        _date_format_with_month_abbrev = _compute_date_format_with_month_abbrev()
+    return _date_format_with_month_abbrev
+
+
+def _compute_date_format_with_month_abbrev():
+    # %x does not use month abbreviation, i.e. it may be confusing
+    # %c has too many fields
+    # Need to find out, whether current locale uses
+    #  - day before or after month
+    #  - with period or without
+    #  - with leading zero or without
+
+    fallback_format = "%d %b"
+    ref_year = 2021
+    ref_month = 12
+    ref_day = 3
+    ref_timestamp = (ref_year, ref_month, ref_day, 0, 0, 0, 0, 0, 0)
+    month_abbrev: str = time.strftime("%b", ref_timestamp)
+    parts = time.strftime("%c", ref_timestamp).split()
+
+    for i, part in enumerate(parts):
+        if str(ref_day) in part:
+            day_index = i
+            if part.startswith("0"):
+                day_fmt = "%d"
+            elif running_on_windows():
+                day_fmt = "%#d"  # without leading zero
+            else:
+                day_fmt = "%-d"  # without leading zero
+
+            if part.endswith("."):
+                day_fmt += "."
+            break
+    else:
+        return fallback_format
+
+    for i, part in enumerate(parts):
+        if month_abbrev.lower() in part.lower():
+            month_index = i
+            if part.endswith("/"):
+                # ja_JP and ko_KR
+                month_fmt = "%b/"
+            else:
+                month_fmt = "%b"
+            break
+    else:
+        return fallback_format
+
+    if month_index < day_index:
+        return f"{month_fmt} {day_fmt}"
+    else:
+        return f"{day_fmt} {month_fmt}"

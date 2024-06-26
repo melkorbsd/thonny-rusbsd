@@ -10,14 +10,15 @@ import time
 import tkinter as tk
 import tkinter.font
 import traceback
+from _tkinter import TclError
+from abc import ABC, abstractmethod
 from logging import getLogger
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union  # @UnusedImport
-
-from _tkinter import TclError
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union  # @UnusedImport
 
 from thonny import get_workbench, misc_utils, tktextext
-from thonny.common import TextRange
+from thonny.common import TextRange, normpath_with_actual_case
+from thonny.custom_notebook import CustomNotebook, CustomNotebookPage, CustomNotebookTab
 from thonny.languages import get_button_padding, tr
 from thonny.misc_utils import (
     running_on_linux,
@@ -32,21 +33,148 @@ PARENS_REGEX = re.compile(r"[\(\)\{\}\[\]]")
 logger = getLogger(__name__)
 
 
+class CustomToolbutton(tk.Frame):
+    def __init__(
+        self,
+        master,
+        command: Callable = None,
+        style: Optional[str] = None,
+        image=None,
+        state="normal",
+        text=None,
+        compound=None,
+        width=None,
+        pad=None,
+        font=None,
+        background=None,
+        foreground=None,
+        borderwidth=0,
+    ):
+        if isinstance(image, (list, tuple)):
+            self.normal_image = image[0]
+            self.disabled_image = image[-1]
+        else:
+            self.normal_image = image
+            self.disabled_image = image
+
+        self.state = state
+        self.style = style
+        style_conf = get_style_configuration("CustomToolbutton")
+        if self.style:
+            style_conf |= get_style_configuration(self.style)
+        self.normal_background = background or style_conf["background"]
+        self.normal_foreground = foreground or style_conf["foreground"]
+        self.hover_background = style_conf["activebackground"]
+
+        if state == "disabled":
+            self.current_image = self.disabled_image
+        else:
+            self.current_image = self.normal_image
+
+        super().__init__(
+            master, background=self.normal_background, borderwidth=borderwidth, relief="solid"
+        )
+        kw = {}
+        if font is not None:
+            kw["font"] = font
+
+        self.label = tk.Label(
+            self,
+            image=self.current_image,
+            text=text,
+            compound=compound,
+            width=None if width is None else ems_to_pixels(width - 1),
+            background=self.normal_background,
+            foreground=self.normal_foreground,
+            **kw,
+        )
+
+        # TODO: introduce padx and pady arguments
+        if isinstance(pad, int):
+            padx = pad
+            pady = pad
+        elif isinstance(pad, (tuple, list)):
+            assert len(pad) == 2
+            # TODO: how to use it?
+            padx = pad
+            pady = 0
+        else:
+            padx = None
+            pady = None
+
+        if text and not image:
+            # text only button content needs adjustment
+            pady = pady or 0
+            pady = (pady, pady + ems_to_pixels(0.23))
+
+        self.label.grid(row=0, column=0, padx=padx, pady=pady, sticky="nsew")
+        self.command = command
+        self.bind("<1>", self.on_click, True)
+        self.label.bind("<1>", self.on_click, True)
+        self.bind("<Enter>", self.on_enter, True)
+        self.bind("<Leave>", self.on_leave, True)
+
+    def cget(self, key: str) -> Any:
+        if key in ["text", "image"]:
+            return self.label.cget(key)
+        else:
+            return super().cget(key)
+
+    def on_click(self, event):
+        if self.state == "normal":
+            self.command()
+
+    def on_enter(self, event):
+        if self.state == "normal":
+            super().configure(background=self.hover_background)
+            self.label.configure(background=self.hover_background)
+
+    def on_leave(self, event):
+        super().configure(background=self.normal_background)
+        self.label.configure(background=self.normal_background)
+
+    def configure(self, cnf={}, state=None, image=None, command=None, **kw):
+        if command:
+            self.command = command
+
+        if "state" in cnf and not state:
+            state = cnf.get("state")
+        elif not state:
+            state = "normal"
+
+        self.state = state
+        if image:
+            self.current_image = image
+        elif self.state == "disabled":
+            self.current_image = self.disabled_image
+        else:
+            self.current_image = self.normal_image
+
+        # tkinter.Frame should be always state=normal as it won't display the image if "disabled"
+        # at least on mac with Tk 8.6.13
+        self.label.configure(cnf, image=self.current_image, state="normal", **kw)
+
+
 class CommonDialog(tk.Toplevel):
-    def __init__(self, master=None, **kw):
+    def __init__(self, master=None, skip_tk_dialog_attributes=False, **kw):
         assert master
         super().__init__(master=master, class_="Thonny", **kw)
         self.withdraw()  # remain invisible until size calculations are done
 
-        # TODO: Is it still required ?
-        # self.bind("<FocusIn>", self._unlock_on_focus_in, True)
+        # Opening a dialog and minimizing everything with Win-D in Windows makes the main
+        # window and dialog stuck. This is a work-around.
+        self.bind("<FocusIn>", self._unlock_on_focus_in, True)
 
-        # https://bugs.python.org/issue43655
-        if self._windowingsystem == "aqua":
-            self.tk.call("::tk::unsupported::MacWindowStyle", "style", self, "moveableModal", "")
-        elif self._windowingsystem == "x11":
-            self.wm_attributes("-type", "dialog")
+        if not skip_tk_dialog_attributes:
+            # https://bugs.python.org/issue43655
+            if self._windowingsystem == "aqua":
+                self.tk.call(
+                    "::tk::unsupported::MacWindowStyle", "style", self, "moveableModal", "closeBox"
+                )
+            elif self._windowingsystem == "x11":
+                self.wm_attributes("-type", "dialog")
 
+        self.resizable(True, True)
         self.parent = master
 
     def _unlock_on_focus_in(self, event):
@@ -77,6 +205,7 @@ class CommonDialog(tk.Toplevel):
                 ttk.Treeview,
                 tk.Text,
                 ttk.Notebook,
+                CustomNotebook,
                 ttk.Button,
                 tk.Listbox,
             ),
@@ -255,474 +384,124 @@ class CustomMenubar(ttk.Frame):
         self._menus.append(menu)
 
 
-class AutomaticPanedWindow(tk.PanedWindow):
-    """
-    Enables inserting panes according to their position_key-s.
-    Automatically adds/removes itself to/from its master AutomaticPanedWindow.
-    Fixes some style glitches.
-    """
-
-    def __init__(self, master, position_key=None, preferred_size_in_pw=None, **kwargs):
-        tk.PanedWindow.__init__(self, master, border=0, **kwargs)
-        self._pane_minsize = 100
-        self.position_key = position_key
-        self._restoring_pane_sizes = False
-
-        self._last_window_size = (0, 0)
-        self._full_size_not_final = True
-        self._configure_binding = self.bind("<Configure>", self._on_window_resize, True)
+class WorkbenchPanedWindow(tk.PanedWindow):
+    def __init__(
+        self,
+        master: tk.Widget,
+        orient: Literal["horizontal", "vertical"],
+        size_config_key: Optional[str] = None,
+    ):
+        self.size_config_key = size_config_key
+        super().__init__(master, orient=orient)
         self._update_appearance_binding = self.bind(
             "<<ThemeChanged>>", self._update_appearance, True
         )
-        self.bind("<B1-Motion>", self._on_mouse_dragged, True)
         self._update_appearance()
 
-        # should be in the end, so that it can be detected when
-        # constructor hasn't completed yet
-        self.preferred_size_in_pw = preferred_size_in_pw
+    def all_children_hidden(self):
+        for child in self.panes():
+            if not self.panecget(child, "hide"):
+                return False
 
-    def insert(self, pos, child, **kw):
-        kw.setdefault("minsize", self._pane_minsize)
+        return True
 
-        if pos == "auto":
-            # According to documentation I should use self.panes()
-            # but this doesn't return expected widgets
-            for sibling in sorted(
-                self.pane_widgets(),
-                key=lambda p: p.position_key if hasattr(p, "position_key") else 0,
-            ):
-                if (
-                    not hasattr(sibling, "position_key")
-                    or sibling.position_key == None
-                    or sibling.position_key > child.position_key
-                ):
-                    pos = sibling
-                    break
-            else:
-                pos = "end"
-
-        if isinstance(pos, tk.Widget):
-            kw["before"] = pos
-
-        self.add(child, **kw)
-
-    def add(self, child, **kw):
-        kw.setdefault("minsize", self._pane_minsize)
-
-        tk.PanedWindow.add(self, child, **kw)
-        self._update_visibility()
-        self._check_restore_preferred_sizes()
-
-    def remove(self, child):
-        tk.PanedWindow.remove(self, child)
-        self._update_visibility()
-        self._check_restore_preferred_sizes()
-
-    def forget(self, child):
-        tk.PanedWindow.forget(self, child)
-        self._update_visibility()
-        self._check_restore_preferred_sizes()
-
-    def destroy(self):
-        self.unbind("<Configure>", self._configure_binding)
-        self.unbind("<<ThemeChanged>>", self._update_appearance_binding)
-        tk.PanedWindow.destroy(self)
-
-    def is_visible(self):
-        if not isinstance(self.master, AutomaticPanedWindow):
-            return self.winfo_ismapped()
-        else:
-            return self in self.master.pane_widgets()
-
-    def pane_widgets(self):
-        result = []
-        for pane in self.panes():
-            # pane is not the widget but some kind of reference object
-            assert not isinstance(pane, tk.Widget)
-            result.append(self.nametowidget(str(pane)))
-        return result
-
-    def _on_window_resize(self, event):
-        if event.width < 10 or event.height < 10:
-            return
-        window = self.winfo_toplevel()
-        window_size = (window.winfo_width(), window.winfo_height())
-        initializing = hasattr(window, "initializing") and window.initializing
-
-        if (
-            not initializing
-            and not self._restoring_pane_sizes
-            and (window_size != self._last_window_size or self._full_size_not_final)
-        ):
-            self._check_restore_preferred_sizes()
-            self._last_window_size = window_size
-
-    def _on_mouse_dragged(self, event):
-        if event.widget == self and not self._restoring_pane_sizes:
-            self._update_preferred_sizes()
-
-    def _update_preferred_sizes(self):
-        for pane in self.pane_widgets():
-            if getattr(pane, "preferred_size_in_pw", None) is not None:
-                if self.cget("orient") == "horizontal":
-                    current_size = pane.winfo_width()
+    def update_visibility(self):
+        if isinstance(self.master, tk.PanedWindow):
+            should_be_hidden = self.all_children_hidden()
+            if self.winfo_ismapped() and should_be_hidden and self.size_config_key is not None:
+                if self.cget("orient") == "vertical":
+                    value = self.winfo_width()
                 else:
-                    current_size = pane.winfo_height()
+                    value = self.winfo_height()
 
-                if current_size > 20:
-                    pane.preferred_size_in_pw = current_size
+                get_workbench().set_option(self.size_config_key, value)
 
-                    # paneconfig width/height effectively puts
-                    # unexplainable maxsize to some panes
-                    # if self.cget("orient") == "horizontal":
-                    #    self.paneconfig(pane, width=current_size)
-                    # else:
-                    #    self.paneconfig(pane, height=current_size)
-                    #
-            # else:
-            #    self.paneconfig(pane, width=1000, height=1000)
-
-    def _check_restore_preferred_sizes(self):
-        window = self.winfo_toplevel()
-        if getattr(window, "initializing", False):
-            return
-
-        try:
-            self._restoring_pane_sizes = True
-            self._restore_preferred_sizes()
-        finally:
-            self._restoring_pane_sizes = False
-
-    def _restore_preferred_sizes(self):
-        total_preferred_size = 0
-        panes_without_preferred_size = []
-
-        panes = self.pane_widgets()
-        for pane in panes:
-            if not hasattr(pane, "preferred_size_in_pw"):
-                # child isn't fully constructed yet
-                return
-
-            if pane.preferred_size_in_pw is None:
-                panes_without_preferred_size.append(pane)
-                # self.paneconfig(pane, width=1000, height=1000)
-            else:
-                total_preferred_size += pane.preferred_size_in_pw
-
-                # Without updating pane width/height attribute
-                # the preferred size may lose effect when squeezing
-                # non-preferred panes too small. Also zooming/unzooming
-                # changes the supposedly fixed panes ...
-                #
-                # but
-                # paneconfig width/height effectively puts
-                # unexplainable maxsize to some panes
-                # if self.cget("orient") == "horizontal":
-                #    self.paneconfig(pane, width=pane.preferred_size_in_pw)
-                # else:
-                #    self.paneconfig(pane, height=pane.preferred_size_in_pw)
-
-        assert len(panes_without_preferred_size) <= 1
-
-        size = self._get_size()
-        if size is None:
-            return
-
-        leftover_size = self._get_size() - total_preferred_size
-        used_size = 0
-        for i, pane in enumerate(panes[:-1]):
-            used_size += pane.preferred_size_in_pw or leftover_size
-            self._place_sash(i, used_size)
-            used_size += int(str(self.cget("sashwidth")))
-
-    def _get_size(self):
-        if self.cget("orient") == tk.HORIZONTAL:
-            result = self.winfo_width()
-        else:
-            result = self.winfo_height()
-
-        if result < 20:
-            # Not ready yet
-            return None
-        else:
-            return result
-
-    def _place_sash(self, i, distance):
-        if self.cget("orient") == tk.HORIZONTAL:
-            self.sash_place(i, distance, 0)
-        else:
-            self.sash_place(i, 0, distance)
-
-    def _update_visibility(self):
-        if not isinstance(self.master, AutomaticPanedWindow):
-            return
-
-        if len(self.panes()) == 0 and self.is_visible():
-            self.master.forget(self)
-
-        if len(self.panes()) > 0 and not self.is_visible():
-            self.master.insert("auto", self)
+            self.master.paneconfig(self, hide=should_be_hidden)
 
     def _update_appearance(self, event=None):
         self.configure(sashwidth=lookup_style_option("Sash", "sashthickness", ems_to_pixels(0.6)))
-        self.configure(background=lookup_style_option("TPanedWindow", "background"))
+        self.configure(background=lookup_style_option(".", "background"))
+
+    def destroy(self):
+        self.unbind("<<ThemeChanged>>", self._update_appearance_binding)
+        super().destroy()
+
+    def has_several_visible_panes(self):
+        count = 0
+        for child in self.winfo_children():
+            if child.winfo_ismapped():
+                count += 1
+
+        return count > 1
 
 
-class ClosableNotebook(ttk.Notebook):
-    def __init__(self, master, style="ButtonNotebook.TNotebook", **kw):
-        super().__init__(master, style=style, **kw)
-
-        self.tab_menu = self.create_tab_menu()
-        self._popup_index = None
-        self.pressed_index = None
-
-        self.bind("<ButtonPress-1>", self._letf_btn_press, True)
-        self.bind("<ButtonRelease-1>", self._left_btn_release, True)
-        if running_on_mac_os():
-            self.bind("<ButtonPress-2>", self._right_btn_press, True)
-            self.bind("<Control-Button-1>", self._right_btn_press, True)
-        else:
-            self.bind("<ButtonPress-3>", self._right_btn_press, True)
-
-        # self._check_update_style()
-
-    def create_tab_menu(self):
-        menu = tk.Menu(self.winfo_toplevel(), tearoff=False, **get_style_configuration("Menu"))
-        menu.add_command(label=tr("Close"), command=self._close_tab_from_menu)
-        menu.add_command(label=tr("Close others"), command=self._close_other_tabs)
-        menu.add_command(label=tr("Close all"), command=self.close_tabs)
-        return menu
-
-    def _letf_btn_press(self, event):
-        try:
-            elem = self.identify(event.x, event.y)
-            index = self.index("@%d,%d" % (event.x, event.y))
-
-            if "closebutton" in elem:
-                self.state(["pressed"])
-                self.pressed_index = index
-        except Exception:
-            # may fail, if clicked outside of tab
-            return
-
-    def _left_btn_release(self, event):
-        if not self.instate(["pressed"]):
-            return
-
-        try:
-            elem = self.identify(event.x, event.y)
-            index = self.index("@%d,%d" % (event.x, event.y))
-        except Exception:
-            # may fail, when mouse is dragged
-            return
-        else:
-            if "closebutton" in elem and self.pressed_index == index:
-                self.close_tab(index)
-
-            self.state(["!pressed"])
-        finally:
-            self.pressed_index = None
-
-    def _right_btn_press(self, event):
-        try:
-            index = self.index("@%d,%d" % (event.x, event.y))
-            self._popup_index = index
-            self.tab_menu.tk_popup(*self.winfo_toplevel().winfo_pointerxy())
-        except Exception:
-            logger.exception("Opening tab menu")
-
-    def _close_tab_from_menu(self):
-        self.close_tab(self._popup_index)
-
-    def _close_other_tabs(self):
-        self.close_tabs(except_index=self._popup_index)
-
-    def close_tabs(self, except_index=None):
-        for tab_index in reversed(range(len(self.winfo_children()))):
-            if except_index is not None and tab_index == except_index:
-                continue
-            else:
-                self.close_tab(tab_index)
-
-    def close_tab(self, index):
-        child = self.get_child_by_index(index)
-        if hasattr(child, "close"):
-            child.close()
-        else:
-            self.forget(index)
-            child.destroy()
-
-    def get_child_by_index(self, index):
-        tab_id = self.tabs()[index]
-        if tab_id:
-            return self.nametowidget(tab_id)
-        else:
-            return None
-
-    def get_current_child(self):
-        child_id = self.select()
-        if child_id:
-            return self.nametowidget(child_id)
-        else:
-            return None
-
-    def focus_set(self):
-        editor = self.get_current_child()
-        if editor:
-            editor.focus_set()
-        else:
-            super().focus_set()
-
-    def _check_update_style(self):
-        style = ttk.Style()
-        if "closebutton" in style.element_names():
-            # It's done already
-            return
-
-        # respect if required images have been defined already
-        if "img_close" not in self.image_names():
-            img_dir = os.path.join(os.path.dirname(__file__), "res")
-            ClosableNotebook._close_img = tk.PhotoImage(
-                "img_tab_close", file=os.path.join(img_dir, "tab_close.gif")
-            )
-            ClosableNotebook._close_active_img = tk.PhotoImage(
-                "img_tab_close_active", file=os.path.join(img_dir, "tab_close_active.gif")
-            )
-
-        style.element_create(
-            "closebutton",
-            "image",
-            "img_tab_close",
-            ("active", "pressed", "!disabled", "img_tab_close_active"),
-            ("active", "!disabled", "img_tab_close_active"),
-            border=8,
-            sticky="",
-        )
-
-        style.layout(
-            "ButtonNotebook.TNotebook.Tab",
-            [
-                (
-                    "Notebook.tab",
-                    {
-                        "sticky": "nswe",
-                        "children": [
-                            (
-                                "Notebook.padding",
-                                {
-                                    "side": "top",
-                                    "sticky": "nswe",
-                                    "children": [
-                                        (
-                                            "Notebook.focus",
-                                            {
-                                                "side": "top",
-                                                "sticky": "nswe",
-                                                "children": [
-                                                    (
-                                                        "Notebook.label",
-                                                        {"side": "left", "sticky": ""},
-                                                    ),
-                                                    (
-                                                        "Notebook.closebutton",
-                                                        {"side": "left", "sticky": ""},
-                                                    ),
-                                                ],
-                                            },
-                                        )
-                                    ],
-                                },
-                            )
-                        ],
-                    },
-                )
-            ],
-        )
-
-    def _check_remove_padding(self, kw):
-        # Windows themes produce 1-pixel padding to the bottom of the pane
-        # Don't know how to get rid of it using themes
-        if "padding" not in kw and ttk.Style().theme_use().lower() in (
-            "windows",
-            "xpnative",
-            "vista",
-        ):
-            kw["padding"] = (0, 0, 0, -1)
-
-    def add(self, child, **kw):
-        self._check_remove_padding(kw)
-        super().add(child, **kw)
-
-    def insert(self, pos, child, **kw):
-        self._check_remove_padding(kw)
-        super().insert(pos, child, **kw)
-
-
-class AutomaticNotebook(ClosableNotebook):
+class ViewNotebook(CustomNotebook):
     """
     Enables inserting views according to their position keys.
     Remember its own position key. Automatically updates its visibility.
     """
 
-    def __init__(self, master, position_key, preferred_size_in_pw=None):
+    def __init__(self, master, location_in_workbench, position_key):
+        self.location_in_workbench = location_in_workbench
         if get_workbench().in_simple_mode():
-            style = "TNotebook"
+            closable = False
         else:
-            style = "ButtonNotebook.TNotebook"
-        super().__init__(master, style=style, padding=0)
+            closable = True
+        super().__init__(master, closable=closable)
         self.position_key = position_key
 
-        # should be in the end, so that it can be detected when
-        # constructor hasn't completed yet
-        self.preferred_size_in_pw = preferred_size_in_pw
+    def forget(self, child: tk.Widget) -> None:
+        if (
+            isinstance(self.master, WorkbenchPanedWindow)
+            and self.master.has_several_visible_panes()
+        ):
+            close_height = self.winfo_height()
+            get_workbench().set_option(
+                f"layout.{self.location_in_workbench}_nb_height", close_height
+            )
 
-    def add(self, child, **kw):
-        super().add(child, **kw)
+        super().forget(child)
+
+    def after_insert(
+        self,
+        pos: Union[int, Literal["end"]],
+        page: CustomNotebookPage,
+        old_notebook: Optional[CustomNotebook],
+    ) -> None:
+        super().after_insert(pos, page, old_notebook)
         self._update_visibility()
+        if old_notebook is None:
+            get_workbench().event_generate("NotebookPageOpened", page=page)
+        else:
+            get_workbench().event_generate(
+                "NotebookPageMoved", page=page, new_notebook=self, old_notebook=old_notebook
+            )
 
-    def insert(self, pos, child, **kw):
-        if pos == "auto":
-            for sibling in map(self.nametowidget, self.tabs()):
-                if (
-                    not hasattr(sibling, "position_key")
-                    or sibling.position_key == None
-                    or sibling.position_key > child.position_key
-                ):
-                    pos = sibling
-                    break
-            else:
-                pos = "end"
-
-        super().insert(pos, child, **kw)
+    def after_forget(
+        self, pos: int, page: CustomNotebookPage, new_notebook: Optional[CustomNotebook]
+    ):
+        # see the comment at after_add_or_insert
+        super().after_forget(pos, page, new_notebook)
         self._update_visibility()
+        if new_notebook is None:
+            get_workbench().event_generate("NotebookPageClosed", page=page)
+        # if there is new_notebook, then Workbench gets its Moved event from it
 
-    def hide(self, tab_id):
-        super().hide(tab_id)
-        self._update_visibility()
-
-    def forget(self, tab_id):
-        if tab_id in self.tabs() or tab_id in self.winfo_children():
-            super().forget(tab_id)
-        self._update_visibility()
-
-    def is_visible(self):
-        return self in self.master.pane_widgets()
-
-    def get_visible_child(self):
-        for child in self.winfo_children():
-            if str(child) == str(self.select()):
-                return child
-
-        return None
+    def _is_visible(self):
+        return self.winfo_ismapped()
 
     def _update_visibility(self):
-        if not isinstance(self.master, AutomaticPanedWindow):
-            return
-        if len(self.tabs()) == 0 and self.is_visible():
-            self.master.remove(self)
+        if isinstance(self.master, WorkbenchPanedWindow):
+            if len(self.tabs()) == 0 and self._is_visible():
+                self.master.paneconfig(self, hide=True)
 
-        if len(self.tabs()) > 0 and not self.is_visible():
-            self.master.insert("auto", self)
+            if len(self.tabs()) > 0 and not self._is_visible():
+                self.master.paneconfig(self, hide=False)
+
+            self.master.update_visibility()
+
+    def allows_dragging_to_another_notebook(self) -> bool:
+        return True
 
 
 class TreeFrame(ttk.Frame):
@@ -738,14 +517,17 @@ class TreeFrame(ttk.Frame):
         **tree_kw,
     ):
         ttk.Frame.__init__(self, master, borderwidth=borderwidth, relief=relief)
-        # http://wiki.tcl.tk/44444#pagetoc50f90d9a
-        self.vert_scrollbar = ttk.Scrollbar(
-            self, orient=tk.VERTICAL, style=scrollbar_style("Vertical")
-        )
+        self.vert_scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL)
         if show_scrollbar:
             self.vert_scrollbar.grid(
                 row=0, column=1, sticky=tk.NSEW, rowspan=2 if show_statusbar else 1
             )
+            scrollbar_stripe = check_create_aqua_scrollbar_stripe(self)
+            if scrollbar_stripe is not None:
+                scrollbar_stripe.grid(
+                    row=0, column=1, sticky="nse", rowspan=2 if show_statusbar else 1
+                )
+                scrollbar_stripe.tkraise()
 
         self.tree = ttk.Treeview(
             self,
@@ -756,11 +538,22 @@ class TreeFrame(ttk.Frame):
         )
         self.tree["show"] = "headings"
         self.tree.grid(row=0, column=0, sticky=tk.NSEW)
+        header_stripe = check_create_heading_stripe(self)
+        if header_stripe is not None:
+            header_stripe.grid(row=0, column=0, sticky="new")
+            header_stripe.tkraise()
         self.vert_scrollbar["command"] = self.tree.yview
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         self.tree.bind("<<TreeviewSelect>>", self.on_select, "+")
         self.tree.bind("<Double-Button-1>", self.on_double_click, "+")
+        self.tree.bind("<Button-3>", self.on_secondary_click, True)
+        if misc_utils.running_on_mac_os():
+            self.tree.bind("<2>", self.on_secondary_click, True)
+            self.tree.bind("<Control-1>", self.on_secondary_click, True)
+
+        self.context_menu = tk.Menu(self.tree, tearoff=0)
+        self.context_menu.add_command(command=self.on_copy, label="Copy")
 
         self.error_label = ttk.Label(self.tree)
 
@@ -777,6 +570,20 @@ class TreeFrame(ttk.Frame):
     def clear(self):
         self._clear_tree()
 
+    def on_secondary_click(self, event):
+        self.tree.identify_row(event.y)
+        self.context_menu.post(event.x_root, event.y_root)
+
+    def on_copy(self):
+        texts = []
+        for item in self.tree.selection():
+            text = self.tree.item(item, option="text")
+            values = map(str, self.tree.item(item, option="values"))
+            combined = text + "\t" + "\t".join(values)
+            texts.append(combined.strip("\t"))
+        self.clipboard_clear()
+        self.clipboard_append(os.linesep.join(texts))
+
     def on_select(self, event):
         pass
 
@@ -789,16 +596,6 @@ class TreeFrame(ttk.Frame):
 
     def clear_error(self):
         self.error_label.grid_remove()
-
-
-def scrollbar_style(orientation):
-    # In mac ttk.Scrollbar uses native rendering unless style attribute is set
-    # see http://wiki.tcl.tk/44444#pagetoc50f90d9a
-    # Native rendering doesn't look good in dark themes
-    if running_on_mac_os() and get_workbench().uses_dark_ui_theme():
-        return orientation + ".TScrollbar"
-    else:
-        return None
 
 
 def sequence_to_accelerator(sequence):
@@ -833,6 +630,7 @@ def sequence_to_accelerator(sequence):
         .replace("minus", "-")
         .replace("Plus", "+")
         .replace("plus", "+")
+        .replace("space", "Space")
     )
 
     return accelerator
@@ -856,9 +654,24 @@ def set_zoomed(toplevel, value):
 
 
 class EnhancedTextWithLogging(tktextext.EnhancedText):
-    def __init__(self, master=None, style="Text", tag_current_line=False, cnf={}, **kw):
+    def __init__(
+        self,
+        master,
+        indent_width: int,
+        tab_width: int,
+        style="Text",
+        tag_current_line=False,
+        cnf={},
+        **kw,
+    ):
         super().__init__(
-            master=master, style=style, tag_current_line=tag_current_line, cnf=cnf, **kw
+            master=master,
+            indent_width=indent_width,
+            tab_width=tab_width,
+            style=style,
+            tag_current_line=tag_current_line,
+            cnf=cnf,
+            **kw,
         )
 
         self._last_event_changed_line_count = False
@@ -878,15 +691,16 @@ class EnhancedTextWithLogging(tktextext.EnhancedText):
         trivial_for_coloring, trivial_for_parens = self._is_trivial_edit(
             chars, line_before, line_after
         )
-        get_workbench().event_generate(
-            "TextInsert",
-            index=concrete_index,
-            text=chars,
-            tags=tags,
-            text_widget=self,
-            trivial_for_coloring=trivial_for_coloring,
-            trivial_for_parens=trivial_for_parens,
-        )
+        if not self._suppress_events:
+            get_workbench().event_generate(
+                "TextInsert",
+                index=concrete_index,
+                text=chars,
+                tags=tags,
+                text_widget=self,
+                trivial_for_coloring=trivial_for_coloring,
+                trivial_for_parens=trivial_for_parens,
+            )
         return result
 
     def direct_delete(self, index1, index2=None, **kw):
@@ -913,14 +727,15 @@ class EnhancedTextWithLogging(tktextext.EnhancedText):
             trivial_for_coloring, trivial_for_parens = self._is_trivial_edit(
                 chars, line_before, line_after
             )
-            get_workbench().event_generate(
-                "TextDelete",
-                index1=concrete_index1,
-                index2=concrete_index2,
-                text_widget=self,
-                trivial_for_coloring=trivial_for_coloring,
-                trivial_for_parens=trivial_for_parens,
-            )
+            if not self._suppress_events:
+                get_workbench().event_generate(
+                    "TextDelete",
+                    index1=concrete_index1,
+                    index2=concrete_index2,
+                    text_widget=self,
+                    trivial_for_coloring=trivial_for_coloring,
+                    trivial_for_parens=trivial_for_parens,
+                )
 
     def _is_trivial_edit(self, chars, line_before, line_after):
         # line is taken after edit for insertion and before edit for deletion
@@ -1155,20 +970,24 @@ class ToolTip:
     """Taken from http://www.voidspace.org.uk/python/weblog/arch_d7_2006_07_01.shtml"""
 
     def __init__(self, widget, options):
-        self.widget = widget
+        self.widget: tk.Widget = widget
         self.tipwindow = None
         self.id = None
         self.x = self.y = 0
         self.options = options
+        self.focus_out_bind_ref = None
 
     def showtip(self, text):
         "Display text in tooltip window"
         self.text = text
         if self.tipwindow or not self.text:
             return
+
+        # x = self.widget.winfo_pointerx() + ems_to_pixels(0)
+        # y = self.widget.winfo_pointery() + ems_to_pixels(0.8)
         x, y, _, cy = self.widget.bbox("insert")
-        x = x + self.widget.winfo_rootx() + 27
-        y = y + cy + self.widget.winfo_rooty() + self.widget.winfo_height() + 2
+        x = x + self.widget.winfo_rootx()
+        y = y + self.widget.winfo_rooty() + self.widget.winfo_height() + ems_to_pixels(0.2)
         self.tipwindow = tw = tk.Toplevel(self.widget)
         if running_on_mac_os():
             try:
@@ -1192,15 +1011,17 @@ class ToolTip:
 
         label = tk.Label(tw, text=self.text, **self.options)
         label.pack()
-        # get_workbench().bind("WindowFocusOut", self.hidetip, True)
+        self.focus_out_bind_ref = self.widget.winfo_toplevel().bind(
+            "<FocusOut>", self.hidetip, True
+        )
 
     def hidetip(self, event=None):
         tw = self.tipwindow
         self.tipwindow = None
+        if self.tipwindow:
+            self.widget.unbind("<FocusOut>", self.focus_out_bind_ref)
         if tw:
             tw.destroy()
-
-        # get_workbench().unbind("WindowFocusOut", self.hidetip)
 
 
 def create_tooltip(widget, text, **kw):
@@ -1221,8 +1042,8 @@ def create_tooltip(widget, text, **kw):
     def leave(event):
         toolTip.hidetip()
 
-    widget.bind("<Enter>", enter)
-    widget.bind("<Leave>", leave)
+    widget.bind("<Enter>", enter, True)
+    widget.bind("<Leave>", leave, True)
 
 
 class NoteBox(CommonDialog):
@@ -1316,7 +1137,6 @@ class NoteBox(CommonDialog):
         self._current_chars += chars
 
     def place(self, target, focus=None):
-
         # Compute the area that will be described by this Note
         focus_x = target.winfo_rootx()
         focus_y = target.winfo_rooty()
@@ -1375,7 +1195,6 @@ class NoteBox(CommonDialog):
         self.deiconify()
 
     def show_note(self, *content_items: Union[str, List], target=None, focus=None) -> None:
-
         self.set_content(*content_items)
         self.place(target, focus)
 
@@ -1406,10 +1225,7 @@ class EnhancedVar(tk.Variable):
         super().__init__(master=master, value=value, name=name)
         self.modified = False
         self.modification_listener = modification_listener
-        if sys.version_info < (3, 6):
-            self.trace("w", self._on_write)
-        else:
-            self.trace_add("write", self._on_write)
+        self.trace_add("write", self._on_write)
 
     def _on_write(self, *args):
         self.modified = True
@@ -1964,40 +1780,81 @@ def open_path_in_system_file_manager(path):
 
 
 def _get_dialog_provider():
-    if platform.system() != "Linux" or get_workbench().get_option("file.avoid_zenity"):
-        return filedialog
+    return _CustomDialogProvider
 
-    import shutil
-
-    if shutil.which("zenity"):
+    if platform.system() == "Linux" and get_workbench().get_option("file.use_zenity"):
         return _ZenityDialogProvider
 
     # fallback
     return filedialog
 
 
+def try_restore_focus_after_file_dialog(dialog_parent):
+    if dialog_parent is None:
+        return
+
+    logger.info("Restoring focus to %s", dialog_parent)
+    old_focused_widget = dialog_parent.winfo_toplevel().focus_get()
+
+    dialog_parent.winfo_toplevel().lift()
+    dialog_parent.winfo_toplevel().focus_force()
+    dialog_parent.winfo_toplevel().grab_set()
+    if running_on_mac_os():
+        dialog_parent.winfo_toplevel().grab_release()
+
+    if old_focused_widget is not None:
+        try:
+            old_focused_widget.focus_force()
+        except TclError:
+            logger.warning("Could not restore focus to %r", old_focused_widget)
+
+
 def asksaveasfilename(**options):
     # https://tcl.tk/man/tcl8.6/TkCmd/getOpenFile.htm
-    _check_dialog_parent(options)
-    return _get_dialog_provider().asksaveasfilename(**options)
+    parent = _check_dialog_parent(options)
+    try:
+        result = _get_dialog_provider().asksaveasfilename(**options)
+        # Different tkinter versions may return different values
+        if result in ["", (), None]:
+            return None
+
+        if running_on_windows():
+            # may have /-s instead of \-s and wrong case
+            return os.path.join(
+                normpath_with_actual_case(os.path.dirname(result)),
+                os.path.basename(result),
+            )
+        else:
+            return result
+    finally:
+        try_restore_focus_after_file_dialog(parent)
 
 
 def askopenfilename(**options):
     # https://tcl.tk/man/tcl8.6/TkCmd/getOpenFile.htm
-    _check_dialog_parent(options)
-    return _get_dialog_provider().askopenfilename(**options)
+    parent = _check_dialog_parent(options)
+    try:
+        return _get_dialog_provider().askopenfilename(**options)
+    finally:
+        try_restore_focus_after_file_dialog(parent)
 
 
 def askopenfilenames(**options):
     # https://tcl.tk/man/tcl8.6/TkCmd/getOpenFile.htm
-    _check_dialog_parent(options)
-    return _get_dialog_provider().askopenfilenames(**options)
+    parent = _check_dialog_parent(options)
+    try:
+        return _get_dialog_provider().askopenfilenames(**options)
+    finally:
+        try_restore_focus_after_file_dialog(parent)
 
 
 def askdirectory(**options):
     # https://tcl.tk/man/tcl8.6/TkCmd/chooseDirectory.htm
-    _check_dialog_parent(options)
-    return _get_dialog_provider().askdirectory(**options)
+    parent = _check_dialog_parent(options)
+    try:
+        return _get_dialog_provider().askdirectory(**options)
+    finally:
+        try_restore_focus_after_file_dialog(parent)
 
 
 def _check_dialog_parent(options):
@@ -2030,6 +1887,8 @@ def _check_dialog_parent(options):
         del options["master"]
         del options["parent"]
 
+    return parent
+
 
 class _ZenityDialogProvider:
     # https://www.writebash.com/bash-gui/zenity-create-file-selection-dialog-224.html
@@ -2040,20 +1899,27 @@ class _ZenityDialogProvider:
 
     @classmethod
     def askopenfilename(cls, **options):
+        if not cls._check_zenity_exists(options["parent"]):
+            return None
+
         args = cls._convert_common_options("Open file", **options)
         return cls._call(args)
 
     @classmethod
     def askopenfilenames(cls, **options):
+        if not cls._check_zenity_exists(options["parent"]):
+            return None
+
         args = cls._convert_common_options("Open files", **options)
         return cls._call(args + ["--multiple"]).split("|")
 
     @classmethod
     def asksaveasfilename(cls, **options):
+        if not cls._check_zenity_exists(options["parent"]):
+            return None
+
         args = cls._convert_common_options("Save as", **options)
         args.append("--save")
-        if options.get("confirmoverwrite", True):
-            args.append("--confirm-overwrite")
 
         filename = cls._call(args)
         if not filename:
@@ -2063,6 +1929,9 @@ class _ZenityDialogProvider:
 
     @classmethod
     def askdirectory(cls, **options):
+        if not cls._check_zenity_exists(options["parent"]):
+            return None
+
         args = cls._convert_common_options("Select directory", **options)
         args.append("--directory")
         return cls._call(args)
@@ -2078,7 +1947,6 @@ class _ZenityDialogProvider:
         parent = options.get("parent", options.get("master", None))
         if parent is not None:
             args.append("--modal")
-            args.append("--attach=%s" % hex(parent.winfo_id()))
 
         for desc, pattern in options.get("filetypes", ()):
             # zenity requires star before extension
@@ -2096,8 +1964,22 @@ class _ZenityDialogProvider:
         return args
 
     @classmethod
+    def _check_zenity_exists(cls, parent) -> bool:
+        import shutil
+
+        if shutil.which("zenity"):
+            return True
+        else:
+            messagebox.showerror(
+                tr("Error"),
+                "Could not find 'zenity'. Is it installed?\n"
+                "Please install it or turn off Zenity file dialogs?",
+            )
+            return False
+
+    @classmethod
     def _call(cls, args):
-        args = ["zenity", "--name=Thonny", "--class=Thonny"] + args
+        args = ["zenity"] + args
         result = subprocess.run(
             args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
@@ -2118,6 +2000,49 @@ def _options_to_zenity_filename(options):
             return options["initialdir"] + os.path.sep
 
     return None
+
+
+class _CustomDialogProvider:
+    @classmethod
+    def askopenfilename(cls, **options):
+        return cls._call("open", **options)
+
+    @classmethod
+    def askopenfilenames(cls, **options):
+        raise NotImplementedError()
+
+    @classmethod
+    def asksaveasfilename(cls, **options):
+        return cls._call("save", **options)
+
+    @classmethod
+    def askdirectory(cls, **options):
+        return cls._call("dir", **options)
+
+    @classmethod
+    def _call(cls, kind: Literal["save", "open", "dir"], **options):
+        from thonny.base_file_browser import (
+            FILE_DIALOG_HEIGHT_EMS_OPTION,
+            FILE_DIALOG_WIDTH_EMS_OPTION,
+            LocalFileDialog,
+        )
+
+        master = options.get("parent") or options.get("master") or get_workbench()
+        initial_dir = options.get("initialdir") or get_workbench().get_local_cwd()
+        dlg = LocalFileDialog(
+            master,
+            kind=kind,
+            initial_dir=initial_dir,
+            filetypes=options.get("filetypes"),
+            typevariable=options.get("typevariable"),
+        )
+        show_dialog(
+            dlg,
+            master,
+            width=ems_to_pixels(get_workbench().get_option(FILE_DIALOG_WIDTH_EMS_OPTION)),
+            height=ems_to_pixels(get_workbench().get_option(FILE_DIALOG_HEIGHT_EMS_OPTION)),
+        )
+        return dlg.result
 
 
 def register_latin_shortcut(
@@ -2159,7 +2084,9 @@ def handle_mistreated_latin_shortcuts(registry, event):
                     handler()
 
 
-def show_dialog(dlg, master=None, width=None, height=None):
+def show_dialog(
+    dlg, master=None, width=None, height=None, left=None, top=None, modal=True, transient=True
+):
     if getattr(dlg, "closed", False):
         return
 
@@ -2171,7 +2098,7 @@ def show_dialog(dlg, master=None, width=None, height=None):
     get_workbench().event_generate("WindowFocusOut")
     # following order seems to give most smooth appearance
     old_focused_widget = master.focus_get()
-    if master.winfo_toplevel().winfo_viewable():
+    if transient and master.winfo_toplevel().winfo_viewable():
         dlg.transient(master.winfo_toplevel())
 
     saved_size = get_workbench().get_option(get_size_option_name(dlg))
@@ -2182,31 +2109,39 @@ def show_dialog(dlg, master=None, width=None, height=None):
     _place_window(dlg, master, width=width, height=height)
 
     dlg.lift()
-    dlg.wait_visibility()
-
     try:
-        dlg.grab_set()
-    except TclError as e:
-        logger.warning("Can't grab: %s", e)
+        dlg.wait_visibility()
+    except tk.TclError as e:
+        if "was deleted before its visibility changed" in str(e):
+            return
+        else:
+            raise
+
+    if modal:
+        try:
+            dlg.grab_set()
+        except TclError as e:
+            logger.warning("Can't grab: %s", e)
 
     dlg.update_idletasks()
     dlg.focus_set()
     if hasattr(dlg, "set_initial_focus"):
         dlg.set_initial_focus()
 
-    dlg.wait_window(dlg)
-    dlg.grab_release()
-    master.winfo_toplevel().lift()
-    master.winfo_toplevel().focus_force()
-    master.winfo_toplevel().grab_set()
-    if running_on_mac_os():
-        master.winfo_toplevel().grab_release()
+    if modal:
+        dlg.wait_window(dlg)
+        dlg.grab_release()
+        master.winfo_toplevel().lift()
+        master.winfo_toplevel().focus_force()
+        master.winfo_toplevel().grab_set()
+        if running_on_mac_os():
+            master.winfo_toplevel().grab_release()
 
-    if old_focused_widget is not None:
-        try:
-            old_focused_widget.focus_force()
-        except TclError:
-            pass
+        if old_focused_widget is not None:
+            try:
+                old_focused_widget.focus_force()
+            except TclError:
+                pass
 
 
 def popen_with_ui_thread_callback(*Popen_args, on_completion, poll_delay=0.1, **Popen_kwargs):
@@ -2357,6 +2292,8 @@ def get_size_option_name(window):
 def get_default_basic_theme():
     if running_on_windows():
         return "vista"
+    elif running_on_mac_os():
+        return "aqua"
     else:
         return "clam"
 
@@ -2369,6 +2306,13 @@ def ems_to_pixels(x: float) -> int:
     if EM_WIDTH is None:
         EM_WIDTH = tkinter.font.nametofont("TkDefaultFont").measure("m")
     return int(EM_WIDTH * x)
+
+
+def pixels_to_ems(x: int) -> float:
+    global EM_WIDTH
+    if EM_WIDTH is None:
+        EM_WIDTH = tkinter.font.nametofont("TkDefaultFont").measure("m")
+    return x / EM_WIDTH
 
 
 _btn_padding = None
@@ -2440,26 +2384,47 @@ def windows_known_extensions_are_hidden() -> bool:
 
 
 class MappingCombobox(ttk.Combobox):
-    def __init__(self, master, mapping=None, **kw):
-        super().__init__(master, **kw)
-
-        if mapping is None:
-            mapping = {}
-
-        self.mapping: Dict[str, Any]
-        self.set_mapping(mapping)
+    def __init__(
+        self, master, mapping: Dict[str, Any], value_variable: Optional[tk.Variable] = None, **kw
+    ):
+        self.mapping = mapping
+        self.value_variable = value_variable
         self.mapping_desc_variable = tk.StringVar(value="")
+
+        super().__init__(master, **kw)
+        self.set_mapping(mapping)
         self.configure(textvariable=self.mapping_desc_variable)
 
-        self.state(["!disabled", "readonly"])
+        if kw.get("state", None) == "disabled":
+            self.state(["readonly"])
+        else:
+            self.state(["!disabled", "readonly"])
+
+        self.bind("<<ComboboxSelected>>", self.on_select_value, True)
+
+        if self.value_variable is not None:
+            self.select_value(self.value_variable.get())
 
     def set_mapping(self, mapping: Dict[str, Any]):
         self.mapping = mapping
         self["values"] = list(mapping)
+        self.select_clear()
+
+    def add_pair(self, label, value):
+        self.mapping[label] = value
+        self["values"] = list(self.mapping)
+
+    def on_select_value(self, *event):
+        if self.value_variable is not None:
+            self.value_variable.set(self.get_selected_value())
+        self.select_clear()
 
     def get_selected_value(self) -> Any:
         desc = self.mapping_desc_variable.get()
         return self.mapping.get(desc, None)
+
+    def select_first_value(self) -> None:
+        self.select_value(next(iter(self.mapping.values())))
 
     def select_value(self, value) -> None:
         for desc in self.mapping:
@@ -2494,9 +2459,115 @@ class AdvancedLabel(ttk.Label):
 
     def _on_click(self, *event):
         if self._url:
-            import webbrowser
+            if os.path.isdir(self._url):
+                open_with_default_app(self._url)
+            else:
+                import webbrowser
 
-            webbrowser.open(self._url)
+                webbrowser.open(self._url)
+
+
+def os_is_in_dark_mode() -> Optional[bool]:
+    if running_on_mac_os():
+        try:
+            return bool(
+                int(
+                    tk._default_root.eval(
+                        f"tk::unsupported::MacWindowStyle isdark {tk._default_root}"
+                    )
+                )
+            )
+        except Exception:
+            logger.exception("Could not query for dark mode")
+            return None
+
+    return None
+
+
+def check_create_aqua_scrollbar_stripe(master) -> Optional[tk.Frame]:
+    if get_workbench().is_using_aqua_based_theme():
+        # Want to cover a gray stripe on the right edge of the scrollbar.
+        # Not sure if it is good idea to use fixed colors, but no named (light-dark aware) color matches.
+        # Best dynamic alternative is probably systemTextBackgroundColor
+        if os_is_in_dark_mode():
+            stripe_color = "#2d2e31"
+        else:
+            stripe_color = "#fafafa"
+        return tk.Frame(master, width=1, background=stripe_color)
+    else:
+        return None
+
+
+def check_create_heading_stripe(master) -> Optional[tk.Frame]:
+    opts = get_style_configuration("Heading")
+    px_to_hide = opts.get("topmost_pixels_to_hide", 0)
+    background = opts.get("background")
+    if px_to_hide > 0 and background is not None:
+        return tk.Frame(master, height=px_to_hide, background=background)
+    else:
+        return None
+
+
+def open_with_default_app(path):
+    if running_on_windows():
+        os.startfile(path)
+    elif running_on_mac_os():
+        subprocess.run(["open", path])
+    else:
+        subprocess.run(["xdg-open", path])
+
+
+def compute_tab_stops(tab_width_in_chars: int, font: tk.font.Font, offset_px=0) -> List[int]:
+    tab_pixels = font.measure("n" * tab_width_in_chars)
+
+    tabs = []
+    if offset_px > 0:
+        tabs.append(offset_px)
+
+    for _ in range(20):
+        offset_px += tab_pixels
+        tabs.append(offset_px)
+
+    return tabs
+
+
+def get_last_grid_row(container: tk.Widget) -> int:
+    return container.grid_size()[1] - 1
+
+
+def create_custom_toolbutton_in_frame(master, borderwidth, bordercolor, **kwargs):
+    frame = tk.Frame(master, background=bordercolor)
+    frame.button = CustomToolbutton(frame, **kwargs)
+    frame.button.grid(pady=borderwidth, padx=borderwidth)
+    return frame
+
+
+def set_windows_titlebar_darkness(window: tk.Tk, value: int):
+    import ctypes
+
+    window.update()
+    winfo_id = window.winfo_id()
+    hwnd = ctypes.windll.user32.GetParent(winfo_id)
+    DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+    DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19
+
+    # try with DWMWA_USE_IMMERSIVE_DARK_MODE
+    result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        ctypes.byref(ctypes.c_int(value)),
+        ctypes.sizeof(ctypes.c_int(value)),
+    )
+    if result != 0:
+        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1,
+            ctypes.byref(ctypes.c_int(value)),
+            ctypes.sizeof(ctypes.c_int(value)),
+        )
+        print("got with second", result)
+    else:
+        print("got with first", result)
 
 
 if __name__ == "__main__":

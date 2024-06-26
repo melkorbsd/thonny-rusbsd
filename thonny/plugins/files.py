@@ -11,6 +11,10 @@ from typing import Dict, Iterable, List, Optional, Type
 
 from thonny import get_runner, get_shell, get_workbench, ui_utils
 from thonny.base_file_browser import (
+    FILE_DIALOG_HEIGHT_EMS_OPTION,
+    FILE_DIALOG_ORDER_BY_OPTION,
+    FILE_DIALOG_REVERSE_ORDER_OPTION,
+    FILE_DIALOG_WIDTH_EMS_OPTION,
     HIDDEN_FILES_OPTION,
     BaseLocalFileBrowser,
     BaseRemoteFileBrowser,
@@ -232,8 +236,11 @@ class ActiveLocalFileBrowser(BaseLocalFileBrowser):
         super().add_middle_menu_items(context)
 
     def _get_venv_path(self):
-        CFGFILE = "pyvenv.cfg"
         path = self.get_selected_path()
+        if not path:
+            return None
+
+        CFGFILE = "pyvenv.cfg"
         fnam = self.get_selected_name()
         try:
             if os.path.exists(path):
@@ -244,8 +251,11 @@ class ActiveLocalFileBrowser(BaseLocalFileBrowser):
                 else:
                     if fnam == CFGFILE:
                         return os.path.dirname(path)
-        except Exception as ex:
-            logger.error("_get_venv_path", ex)
+        except Exception:
+            import traceback
+
+            traceback.print_stack()
+            logger.exception("_get_venv_path")
 
     def check_for_venv(self):
         return self._get_venv_path() is not None
@@ -431,7 +441,7 @@ class DownloadDialog(TransferDialog):
             result.append(
                 {
                     "kind": source_item["kind"],
-                    "size": source_item["size"],
+                    "size_bytes": source_item["size_bytes"],
                     "source_path": source_path,
                     "target_path": transpose_path(
                         source_path, source_context_dir, target_dir, PurePosixPath, pathlib.Path
@@ -455,7 +465,7 @@ class DownloadDialog(TransferDialog):
 
                 result[target_path] = {
                     "kind": kind,
-                    "size": size,
+                    "size_bytes": size,
                 }
         return result
 
@@ -508,19 +518,19 @@ def pick_transfer_items(
                     % (item["target_path"], item["source_path"], target_info["kind"], item["kind"])
                 )
             elif item["kind"] == "file":
-                size_diff = item["size"] - target_info["size"]
+                size_diff = item["size_bytes"] - target_info["size_bytes"]
                 if size_diff > 0:
                     replacement = "a larger file (%s + %s)" % (
-                        sizeof_fmt(target_info["size"]),
+                        sizeof_fmt(target_info["size_bytes"]),
                         sizeof_fmt(size_diff),
                     )
                 elif size_diff < 0:
                     replacement = "a smaller file (%s - %s)" % (
-                        sizeof_fmt(target_info["size"]),
+                        sizeof_fmt(target_info["size_bytes"]),
                         sizeof_fmt(-size_diff),
                     )
                 else:
-                    replacement = "a file of same size (%s)" % sizeof_fmt(target_info["size"])
+                    replacement = "a file of same size (%s)" % sizeof_fmt(target_info["size_bytes"])
 
                 overwrites.append("'%s' with %s" % (item["target_path"], replacement))
 
@@ -529,8 +539,8 @@ def pick_transfer_items(
         return []
     elif overwrites:
         if askokcancel(
-            "Overwrite?",
-            "This operation will overwrite\n\n" + format_items(overwrites),
+            tr("Overwrite?"),
+            tr("This operation will overwrite %s") % format_items(overwrites) + "\n\n",
             master=master,
         ):
             return prepared_items
@@ -571,7 +581,7 @@ def prepare_upload_items(
     result = [
         {
             "kind": kind,
-            "size": size,
+            "size_bytes": size,
             "source_path": source_path,
             "target_path": transpose_path(
                 source_path, source_context_dir, target_dir, pathlib.Path, PurePosixPath
@@ -605,10 +615,28 @@ def load_plugin() -> None:
     )
 
     get_workbench().set_default(HIDDEN_FILES_OPTION, False)
+    get_workbench().set_default(FILE_DIALOG_ORDER_BY_OPTION, "name")
+    get_workbench().set_default(FILE_DIALOG_REVERSE_ORDER_OPTION, False)
+    get_workbench().set_default(FILE_DIALOG_WIDTH_EMS_OPTION, 60)
+    get_workbench().set_default(FILE_DIALOG_HEIGHT_EMS_OPTION, 35)
 
     get_workbench().add_view(FilesView, tr("Files"), "nw")
 
-    for ext in [".py", ".pyw", ".pyi", ".txt", ".log", ".json", ".yml", ".yaml", ".md", ".rst"]:
+    for ext in [
+        ".py",
+        ".pyw",
+        ".pyi",
+        ".txt",
+        ".log",
+        ".json",
+        ".yml",
+        ".yaml",
+        ".md",
+        ".rst",
+        ".toml",
+        ".gitignore",
+        ".env",
+    ]:
         get_workbench().set_default(get_file_handler_conf_key(ext), "thonny")
 
 

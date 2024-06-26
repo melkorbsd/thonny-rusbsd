@@ -1,15 +1,19 @@
-jedi==0.18.*
-pyserial==3.5
-pylint==2.14.*
-docutils==0.19.*
-mypy==0.971.*
-asttokens==2.0.*
-Send2Trash==1.8.1b0
-esptool==4.2.*
-bcrypt==3.2.* # has builds available for RPi. Should be good enough for paramiko
-paramiko==2.11.*
-websockets==10.*
+jedi==0.19.*
+pylint==3.2.*
+docutils==0.21.*
+mypy==1.10.*
+asttokens==2.4.*
+Send2Trash==1.8.*
+packaging==24.*
+
+# esptool's and paramiko's dependencies (cryptography) are difficult to build on ARM64 Windows. Skipping paramiko for now.
+esptool==4.7.*; platform_machine != 'ARM64' or sys_platform != 'win32'
+bcrypt==4.1.*; platform_machine != 'ARM64' or sys_platform != 'win32'
+cryptography==38.*; platform_machine != 'ARM64' or sys_platform != 'win32'  # 38 is good fit for macoOS, see also ~/thonny_alt_packages
+paramiko==3.4.*; platform_machine != 'ARM64' or sys_platform != 'win32'
+
+websockets==12.0.*
 ptyprocess==0.7.*; sys_platform == "linux" or sys_platform == "darwin"
-adafruit_board_toolkit==1.1.0; sys_platform == "win32" or sys_platform == "darwin"
+dbus-next==0.2.*; sys_platform == "linux"
 
 

@@ -3,13 +3,16 @@
 """
 Classes used both by front-end and back-end
 """
+from __future__ import annotations
+
+import dataclasses
 import os.path
 import site
 import sys
 from collections import namedtuple
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple  # @UnusedImport
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple  # @UnusedImport
 
 logger = getLogger(__name__)
 
@@ -18,6 +21,8 @@ REPL_PSEUDO_FILENAME = "<stdin>"
 MESSAGE_MARKER = "\x02"
 OBJECT_LINK_START = "[object_link_for_thonny=%d]"
 OBJECT_LINK_END = "[/object_link_for_thonny]"
+REMOTE_PATH_MARKER = " :: "
+PROCESS_ACK = "OK"
 
 IGNORED_FILES_AND_DIRS = [
     "System Volume Information",
@@ -56,10 +61,18 @@ TextRange = namedtuple("TextRange", ["lineno", "col_offset", "end_lineno", "end_
 
 @dataclass(frozen=True)
 class DistInfo:
-    key: str
-    project_name: str
+    name: str
     version: str
-    location: str
+    summary: Optional[str] = None
+    license: Optional[str] = None
+    author: Optional[str] = None
+    classifiers: List[str] = dataclasses.field(default_factory=list)
+    home_page: Optional[str] = None
+    package_url: Optional[str] = None
+    project_urls: Optional[Dict[str, str]] = dataclasses.field(default_factory=dict)
+    requires: List[str] = dataclasses.field(default_factory=list)
+    source: Optional[str] = None
+    installed_location: Optional[str] = None
 
 
 class Record:
@@ -442,6 +455,8 @@ class CompletionInfo:
     prefix_length: int  # the number of chars to be deleted before inserting name
     signatures: Optional[List[SignatureInfo]]
     docstring: Optional[str]
+    module_name: Optional[str]
+    module_path: Optional[str]
 
 
 @dataclass
@@ -503,15 +518,15 @@ def get_single_dir_child_data(path: str, include_hidden: bool = False) -> Option
                     name = os.path.basename(full_child_path)
                     st = os.stat(full_child_path, dir_fd=None, follow_symlinks=True)
                     result[name] = {
-                        "size": None if os.path.isdir(full_child_path) else st.st_size,
-                        "modified": st.st_mtime,
+                        "size_bytes": None if os.path.isdir(full_child_path) else st.st_size,
+                        "modified_epoch": st.st_mtime,
                         "hidden": hidden,
                     }
         except PermissionError:
             result["<not accessible>"] = {
                 "kind": "error",
-                "size": -1,
-                "modified": None,
+                "size_bytes": -1,
+                "modified_epoch": None,
                 "hidden": None,
             }
 
@@ -571,8 +586,8 @@ def get_windows_volumes_info():
                     label = volume_name + " (" + drive + ")"
                     result[path] = {
                         "label": label,
-                        "size": None,
-                        "modified": max(st.st_mtime, st.st_ctime),
+                        "size_bytes": None,
+                        "modified_epoch": max(st.st_mtime, st.st_ctime),
                     }
                 except OSError as e:
                     logger.warning("Could not get information for %s", path, exc_info=e)
@@ -631,8 +646,8 @@ def get_windows_network_locations():
                 target = get_windows_lnk_target(lnk_path)
                 result[target] = {
                     "label": entry.name + " (" + target + ")",
-                    "size": None,
-                    "modified": None,
+                    "size_bytes": None,
+                    "modified_epoch": None,
                 }
             except Exception:
                 logger.error("Can't get target from %s", lnk_path, exc_info=True)
@@ -721,13 +736,11 @@ def universal_relpath(path: str, context: str) -> str:
         return os.path.relpath(path, context)
 
 
-def get_python_version_string(version_info: Optional[Tuple] = None, maxsize=None):
-    result = ".".join(map(str, sys.version_info[:3]))
-    if sys.version_info[3] != "final":
-        result += "-" + sys.version_info[3]
+def get_python_version_string():
+    result = sys.version.split()[0]
 
-    if maxsize is not None:
-        result += " (" + ("64" if sys.maxsize > 2**32 else "32") + " bit)"
+    if sys.maxsize <= 2**32:
+        result += ", 32-bit"
 
     return result
 
@@ -784,14 +797,97 @@ def read_one_incoming_message_str(line_reader):
     return msg_str
 
 
-def is_virtual_executable(executable):
-    exe_dir = os.path.dirname(executable)
-    return os.path.exists(os.path.join(exe_dir, "activate")) or os.path.exists(
-        os.path.join(exe_dir, "activate.bat")
-    )
-
-
 def is_private_python(executable):
     result = os.path.exists(os.path.join(os.path.dirname(executable), "thonny_python.ini"))
     logger.debug("is_private_python(%r) == %r", executable, result)
     return result
+
+
+def running_in_virtual_environment() -> bool:
+    return (
+        hasattr(sys, "base_prefix")
+        and sys.base_prefix != sys.prefix
+        or hasattr(sys, "real_prefix")
+        and getattr(sys, "real_prefix") != sys.prefix
+    )
+
+
+def is_remote_path(s: str) -> bool:
+    return REMOTE_PATH_MARKER in s
+
+
+def is_local_path(s: str) -> bool:
+    return not is_remote_path(s) and not s.startswith("<")
+
+
+def export_distributions_info_from_dir(dir_path: str) -> List[DistInfo]:
+    from importlib.metadata import DistributionFinder, MetadataPathFinder
+
+    dists = MetadataPathFinder.find_distributions(
+        context=DistributionFinder.Context(path=[dir_path])
+    )
+    return export_distributions_info(dists)
+
+
+def export_installed_distributions_info() -> List[DistInfo]:
+    # If it is called after first installation to user site packages
+    # this dir is not yet in sys.path
+    # This would be required also when using Python 3.8 and importlib.metadata.distributions()
+    if (
+        site.ENABLE_USER_SITE
+        and site.getusersitepackages()
+        and os.path.exists(site.getusersitepackages())
+        and site.getusersitepackages() not in sys.path
+    ):
+        # insert before first site packages item
+        for i, item in enumerate(sys.path):
+            if "site-packages" in item or "dist-packages" in item:
+                sys.path.insert(i, site.getusersitepackages())
+                break
+        else:
+            sys.path.append(site.getusersitepackages())
+
+    from importlib.metadata import distributions
+
+    return export_distributions_info(distributions())
+
+
+def export_distributions_info(dists: Iterable) -> List[DistInfo]:
+    def get_project_urls(dist):
+        result = {}
+        for key, value in dist.metadata.items():
+            if key == "Project-URL":
+                label, url = value.split(",", maxsplit=1)
+                label = label.strip()
+                url = url.strip()
+                result[label] = url
+        return result
+
+    def get_dist_name(dist):
+        if hasattr(dist, "name"):
+            return dist.name
+        else:
+            # I met this case with Python 3.9
+            return dist.metadata["Name"]
+
+    def infer_package_url(dist):
+        pypi_url_name = get_dist_name(dist).replace("_", "-")
+        # NB! no guarantee that this package exists at PyPI or related to installed package
+        return f"https://pypi.org/project/{pypi_url_name}/"
+
+    return [
+        DistInfo(
+            name=get_dist_name(dist),
+            version=dist.version,
+            requires=dist.requires or [],
+            summary=dist.metadata["Summary"] or None,
+            author=dist.metadata["Author"] or None,
+            license=dist.metadata["License"] or None,
+            home_page=dist.metadata["Home-page"] or None,
+            project_urls=get_project_urls(dist),
+            package_url=infer_package_url(dist),
+            classifiers=[value for (key, value) in dist.metadata.items() if key == "Classifier"],
+            installed_location=str(dist.locate_file("")),
+        )
+        for dist in dists
+    ]

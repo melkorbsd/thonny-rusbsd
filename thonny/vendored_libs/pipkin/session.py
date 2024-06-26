@@ -29,9 +29,10 @@ from pipkin.util import (
 
 logger = getLogger(__name__)
 
-INITIAL_VENV_DISTS = ["pip", "setuptools", "pkg_resources", "wheel"]
-INITIAL_VENV_FILES = ["easy_install.py"]
+MANAGEMENT_DISTS = ["pip", "setuptools", "pkg_resources", "wheel"]
+MANAGEMENT_FILES = ["easy_install.py"]
 META_ENCODING = "utf-8"
+PIP_VERSION = "24.0"
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,11 @@ class Session:
         state_after = self._get_venv_state()
 
         removed_meta_dirs = {name for name in state_before if name not in state_after}
-        assert not removed_meta_dirs
+        # removed meta dirs are expected when upgrading
+        for meta_dir_name in removed_meta_dirs:
+            self._report_progress(f"Removing {parse_meta_dir_name(meta_dir_name)[0]}")
+            dist_name, _version = parse_meta_dir_name(meta_dir_name)
+            self._adapter.remove_dist(dist_name)
 
         new_meta_dirs = {name for name in state_after if name not in state_before}
         changed_meta_dirs = {
@@ -209,7 +214,6 @@ class Session:
         excludes: Optional[List[str]] = None,
         **_,
     ):
-
         args = ["list"]
 
         if outdated:
@@ -260,7 +264,6 @@ class Session:
         excludes: Optional[List[str]] = None,
         **_,
     ):
-
         args = ["freeze"]
 
         args += self._format_exclusion_args(excludes)
@@ -352,9 +355,12 @@ class Session:
         if cache_command == "purge":
             if os.path.exists(self._get_pipkin_cache_dir()):
                 shutil.rmtree(self._get_pipkin_cache_dir())
+        elif not os.path.exists(self._get_pipkin_cache_dir()):
+            print(f"Cache dir ({self._get_pipkin_cache_dir()}) not created yet")
         elif cache_command == "dir":
             print(self._get_pipkin_cache_dir())
         else:
+            self._ensure_venv()
             self._invoke_pip(["cache", cache_command])
 
     def close(self) -> None:
@@ -364,7 +370,7 @@ class Session:
 
     def _format_exclusion_args(self, excludes: Optional[List[str]]) -> List[str]:
         args = []
-        for exclude in (excludes or []) + ["pip", "pkg_resources", "setuptools", "wheel"]:
+        for exclude in (excludes or []) + MANAGEMENT_DISTS:
             args += ["--exclude", exclude]
 
         return args
@@ -477,34 +483,36 @@ class Session:
         if not os.path.exists(path):
             self._report_progress("Preparing working environment ...")
             logger.info("Start preparing working environment at %s ...", path)
+            venv_cmd = [
+                sys.executable,
+                "-I",
+                "-m",
+                "venv",
+                path,
+            ]
             subprocess.check_call(
-                [
-                    sys.executable,
-                    "-I",
-                    "-m",
-                    "venv",
-                    path,
-                ],
+                venv_cmd,
+                executable=venv_cmd[0],
                 stdin=subprocess.DEVNULL,
             )
             logger.info("Done creating venv")
             assert os.path.exists(path)
+            pip_cmd = [
+                get_venv_executable(path),
+                "-I",
+                "-m",
+                "pip",
+                "--disable-pip-version-check",
+                "install",
+                "--no-warn-script-location",
+                f"pip=={PIP_VERSION}",
+            ]
             subprocess.check_call(
-                [
-                    get_venv_executable(path),
-                    "-I",
-                    "-m",
-                    "pip",
-                    "--disable-pip-version-check",
-                    "install",
-                    "--no-warn-script-location",
-                    "--upgrade",
-                    "pip==22.0.*",
-                    "setuptools==60.9.*",
-                    "wheel==0.37.*",
-                ],
+                pip_cmd,
+                executable=pip_cmd[0],
                 stdin=subprocess.DEVNULL,
             )
+            self._patch_pip(path)
             logger.info("Done preparing working environment.")
         else:
             logger.debug("Using existing working environment at %s", path)
@@ -524,16 +532,67 @@ class Session:
     def _get_venv_site_packages_path(self) -> str:
         return get_venv_site_packages_path(self._venv_dir)
 
+    def _patch_pip(self, venv_path: str) -> None:
+        sp_cmd = [
+            get_venv_executable(venv_path),
+            "-c",
+            "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+        ]
+        site_packages_path = subprocess.check_output(
+            sp_cmd,
+            executable=sp_cmd[0],
+            stdin=subprocess.DEVNULL,
+            universal_newlines=True,
+        ).strip()
+
+        pip_init_path = os.path.join(site_packages_path, "pip", "__init__.py")
+
+        patch = """
+import os
+import pip._vendor.packaging.markers
+import pip._vendor.distlib.markers
+
+ENV_VAR_PREFIX = "pip_marker_"
+
+def patch_context(context):
+    for name in os.environ:
+        if name.startswith(ENV_VAR_PREFIX):
+            marker_name = name[len(ENV_VAR_PREFIX):]
+            value =  os.environ[name]
+            context[marker_name] = value
+
+
+def patch_context_function(fun):
+    def patched_context_function():
+        context = fun()
+        patch_context(context)
+        return context
+    
+    return patched_context_function
+
+pip._vendor.packaging.markers.default_environment = \
+    patch_context_function(pip._vendor.packaging.markers.default_environment)
+pip._vendor.distlib.markers.DEFAULT_CONTEXT = \
+    patch_context(pip._vendor.distlib.markers.DEFAULT_CONTEXT)        
+
+"""
+        logger.info("Patching %r", pip_init_path)
+        with open(pip_init_path, "a", encoding="utf-8") as fp:
+            fp.write(patch)
+
     def _clear_venv(self) -> None:
         sp_path = self._get_venv_site_packages_path()
         logger.debug("Clearing %s", sp_path)
         for name in os.listdir(sp_path):
             full_path = os.path.join(sp_path, name)
-            if self._is_initial_venv_item(name):
+            if self._is_management_item(name):
+                logger.debug("skipping %r", name)
                 continue
             elif os.path.isfile(full_path):
+                logger.debug("removing file %r", name)
                 os.remove(full_path)
             else:
+                logger.debug("removing directory %r", name)
                 assert os.path.isdir(full_path)
                 shutil.rmtree(full_path)
 
@@ -588,7 +647,12 @@ class Session:
         except Exception:
             exe = sys.executable
 
-        venv_name = hashlib.md5(str((exe, sys.version_info[0:2])).encode("utf-8")).hexdigest()
+        import pipkin
+
+        venv_path_source = str(
+            (exe, sys.version_info[0:2], pipkin.__version__.split(".", maxsplit=1)[0], PIP_VERSION)
+        )
+        venv_name = hashlib.md5(venv_path_source.encode("utf-8")).hexdigest()
         return os.path.join(self._get_workspaces_dir(), venv_name)
 
     def _get_workspaces_dir(self) -> str:
@@ -601,12 +665,12 @@ class Session:
             result = os.path.join(result, "cache")
         return result
 
-    def _is_initial_venv_item(self, name: str) -> bool:
+    def _is_management_item(self, name: str) -> bool:
         return (
-            name in INITIAL_VENV_FILES
-            or name in INITIAL_VENV_DISTS
+            name in MANAGEMENT_FILES
+            or name in MANAGEMENT_DISTS
             or name.endswith(".dist-info")
-            and name.split("-")[0] in INITIAL_VENV_DISTS
+            and name.split("-")[0] in MANAGEMENT_DISTS
         )
 
     def _get_venv_state(self, root: str = None) -> Dict[str, float]:
@@ -616,7 +680,7 @@ class Session:
 
         result = {}
         for item_name in os.listdir(root):
-            if self._is_initial_venv_item(item_name):
+            if self._is_management_item(item_name):
                 continue
 
             if item_name.endswith(".dist-info"):
@@ -635,7 +699,6 @@ class Session:
         no_index: bool,
         find_links: Optional[str],
     ):
-
         if no_index:
             assert find_links
             self._invoke_pip(pip_args + ["--no-index", "--find-links", find_links])
@@ -668,7 +731,7 @@ class Session:
         env = {key: os.environ[key] for key in os.environ if not key.startswith("PIP_")}
         env["PIP_CACHE_DIR"] = self._get_pipkin_cache_dir()
 
-        subprocess.check_call(pip_cmd, env=env, stdin=subprocess.DEVNULL)
+        subprocess.check_call(pip_cmd, executable=pip_cmd[0], env=env, stdin=subprocess.DEVNULL)
 
     def _compile_with_mpy_cross(
         self, source_path: str, target_path: str, mpy_cross_path: Optional[str]
@@ -682,7 +745,7 @@ class Session:
         args = (
             [mpy_cross_path] + self._adapter.get_mpy_cross_args() + ["-o", target_path, source_path]
         )
-        subprocess.check_call(args)
+        subprocess.check_call(args, executable=args[0], stdin=subprocess.DEVNULL)
 
     def _ensure_mpy_cross(self) -> str:
         impl_name, ver_prefix = self._adapter.get_implementation_name_and_version_prefix()

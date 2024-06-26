@@ -16,9 +16,10 @@ from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Tupl
 
 import thonny
 from thonny import report_time
-from thonny.common import BackendEvent  # TODO: try to get rid of this
-from thonny.common import (
+from thonny.common import (  # TODO: try to get rid of this
     IGNORED_FILES_AND_DIRS,
+    PROCESS_ACK,
+    BackendEvent,
     CommandToBackend,
     EOFCommand,
     ImmediateCommand,
@@ -29,6 +30,8 @@ from thonny.common import (
     ToplevelCommand,
     ToplevelResponse,
     UserError,
+    execute_with_frontend_sys_path,
+    is_local_path,
     parse_message,
     read_one_incoming_message_str,
     serialize_message,
@@ -221,8 +224,7 @@ class BaseBackend(ABC):
         print(user_msg, file=sys.stderr)
 
     @abstractmethod
-    def _check_for_connection_error(self) -> None:
-        ...
+    def _check_for_connection_error(self) -> None: ...
 
     @abstractmethod
     def _handle_user_input(self, msg: InputSubmission) -> None:
@@ -353,13 +355,22 @@ class MainBackend(BaseBackend, ABC):
         try:
             from thonny import jedi_utils
 
+            sys_path = self._get_sys_path_for_analysis()
+
+            # add current dir for local files
+            """
+            if cmd.filename and is_local_path(cmd.filename):
+                sys_path.insert(0, os.getcwd())
+                logger.debug("editor autocomplete with %r", sys_path)
+            """
+
             with warnings.catch_warnings():
                 completions = jedi_utils.get_script_completions(
                     cmd.source,
                     cmd.row,
                     cmd.column,
                     cmd.filename,
-                    sys_path=self._get_sys_path_for_analysis(),
+                    sys_path=sys_path,
                 )
         except ImportError:
             completions = []
@@ -588,11 +599,10 @@ class UploadDownloadMixin(ABC):
         cmd,
         target_path_class,
     ) -> List[str]:
-
         total_cost = 0
         for item in items:
             if item["kind"] == "file":
-                total_cost += item["size"] + self._get_file_fixed_cost()
+                total_cost += item["size_bytes"] + self._get_file_fixed_cost()
             else:
                 total_cost += self._get_dir_transfer_cost()
 
@@ -623,10 +633,11 @@ class UploadDownloadMixin(ABC):
                 else:
                     if self._supports_directories():
                         ensure_dir(self._get_parent_directory(item["target_path"]))
-                    print("%s (%d bytes)" % (item["source_path"], item["size"]))
+                    print("%s (%d bytes)" % (item["source_path"], item["size_bytes"]))
                     transfer_file_fun(item["source_path"], item["target_path"], copy_bytes_notifier)
-                    completed_cost += self._get_file_fixed_cost() + item["size"]
+                    completed_cost += self._get_file_fixed_cost() + item["size_bytes"]
             except OSError as e:
+                logger.exception("OSError during upload")
                 errors.append(
                     "Could not copy %s to %s: %s"
                     % (item["source_path"], item["target_path"], str(e))
@@ -735,16 +746,9 @@ class RemoteProcess:
 class SshMixin(UploadDownloadMixin):
     def __init__(self, host, user, password, interpreter, cwd):
         # UploadDownloadMixin.__init__(self)
-        try:
-            import paramiko
-            from paramiko.client import AutoAddPolicy, SSHClient
-        except ImportError:
-            print(
-                "\nThis back-end requires an extra package named 'paramiko'."
-                " Install it from 'Tools => Manage plug-ins' or via your system package manager.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+        execute_with_frontend_sys_path(self._try_load_paramiko)
+        import paramiko
+        from paramiko.client import AutoAddPolicy, SSHClient
 
         self._host = host
         self._user = user
@@ -758,6 +762,18 @@ class SshMixin(UploadDownloadMixin):
         self._client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy())
         # TODO: does it get closed properly after process gets killed?
         self._connect()
+
+    def _try_load_paramiko(self):
+        try:
+            import paramiko.client
+        except ImportError:
+            logger.info("Could not import paramiko")
+            print(
+                "\nThis back-end requires an extra package named 'paramiko'."
+                " Install it from 'Tools => Manage plug-ins' or via your system package manager.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     def _connect(self):
         from paramiko import SSHException
@@ -788,17 +804,31 @@ class SshMixin(UploadDownloadMixin):
         # * change to desired directory
         #
         # About -onlcr: https://stackoverflow.com/q/35887380/261181
+        # can't trust the env-argument of the exec_command, as the server may ignore it
+        env_str = " ".join([f"env {key}={shlex.quote(value)}" for key, value in env.items()])
         cmd_line_str = (
             "echo $$ ; stty -echo ; stty -onlcr ; "
             + (" cd %s  2> /dev/null ;" % shlex.quote(cwd) if cwd else "")
-            + (" exec " + " ".join(map(shlex.quote, cmd_items)))
+            + (f" exec {env_str} " + " ".join(map(shlex.quote, cmd_items)))
         )
-        stdin, stdout, _ = self._client.exec_command(
-            cmd_line_str, bufsize=0, get_pty=True, environment=env
-        )
+        logger.info("Starting remote process with following cmd line:\n%s", cmd_line_str)
+        stdin, stdout, _ = self._client.exec_command(cmd_line_str, bufsize=0, get_pty=True)
 
         # stderr gets directed to stdout because of pty
-        pid = stdout.readline().strip()
+        first_line = stdout.readline()
+        second_line = stdout.readline()
+        pid = first_line.strip()
+        ack = second_line.strip()
+        if ack != PROCESS_ACK:
+            print(f"Got {ack!r} instead of expected {PROCESS_ACK!r}", file=sys.stderr)
+            print("Whole output:", file=sys.stderr)
+            print(first_line, end="", file=sys.stderr)
+            print(second_line, end="", file=sys.stderr)
+            while True:
+                line = stdout.readline()
+                if not line:
+                    break
+                print(line, end="", file=sys.stderr)
         channel = stdout.channel
 
         return RemoteProcess(self._client, channel, stdin, stdout, pid)
@@ -821,7 +851,6 @@ class SshMixin(UploadDownloadMixin):
         pass
 
     def _get_sftp(self, fresh: bool):
-
         if fresh and self._sftp is not None:
             self._sftp.close()
             self._sftp = None
@@ -924,7 +953,6 @@ def ensure_posix_directory(
         return
 
     for step in list(reversed(list(map(str, pathlib.PurePosixPath(path).parents)))) + [path]:
-
         if step != "/":
             mode = stat_mode_fun(step)
             if mode is None:
@@ -953,9 +981,9 @@ def interrupt_local_process() -> None:
 
 
 def get_ssh_password_file_path():
-    from thonny import THONNY_USER_DIR
+    from thonny import get_thonny_user_dir
 
-    return os.path.join(THONNY_USER_DIR, "ssh_password")
+    return os.path.join(get_thonny_user_dir(), "ssh_password")
 
 
 def delete_stored_ssh_password():
