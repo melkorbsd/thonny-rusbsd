@@ -9,10 +9,14 @@ import dataclasses
 import os.path
 import site
 import sys
+import urllib.parse
 from collections import namedtuple
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple  # @UnusedImport
+
+REMOTE_URI_PREFIX = "vscode-remote://"
+LOCAL_URI_PREFIX = "file://"
 
 logger = getLogger(__name__)
 
@@ -23,6 +27,9 @@ OBJECT_LINK_START = "[object_link_for_thonny=%d]"
 OBJECT_LINK_END = "[/object_link_for_thonny]"
 REMOTE_PATH_MARKER = " :: "
 PROCESS_ACK = "OK"
+ALL_EXPLAINED_STATUS_CODE = 193
+
+NBSP = "\u00A0"
 
 IGNORED_FILES_AND_DIRS = [
     "System Volume Information",
@@ -388,21 +395,6 @@ def get_site_dir(symbolic_name, executable=None):
         )
 
     return result if result else None
-
-
-def get_base_executable():
-    if sys.exec_prefix == sys.base_exec_prefix:
-        return sys.executable
-
-    if sys.platform == "win32":
-        guess = sys.base_exec_prefix + "\\" + os.path.basename(sys.executable)
-        if os.path.isfile(guess):
-            return normpath_with_actual_case(guess)
-
-    if os.path.islink(sys.executable):
-        return os.path.realpath(sys.executable)
-
-    raise RuntimeError("Don't know how to locate base executable")
 
 
 def get_augmented_system_path(extra_dirs):
@@ -806,12 +798,7 @@ def is_private_python(executable):
 
 
 def running_in_virtual_environment() -> bool:
-    return (
-        hasattr(sys, "base_prefix")
-        and sys.base_prefix != sys.prefix
-        or hasattr(sys, "real_prefix")
-        and getattr(sys, "real_prefix") != sys.prefix
-    )
+    return sys.base_prefix != sys.prefix
 
 
 def is_remote_path(s: str) -> bool:
@@ -820,6 +807,38 @@ def is_remote_path(s: str) -> bool:
 
 def is_local_path(s: str) -> bool:
     return not is_remote_path(s) and not s.startswith("<")
+
+
+def editor_path_matches_uri(path: Optional[str], uri: str) -> bool:
+    if path is None:
+        return False
+
+    if is_remote_path(path):
+        if not uri.startswith(REMOTE_URI_PREFIX):
+            return False
+
+        path_target = extract_target_path(path).rstrip("/")
+        uri_target = file_uri_to_path(uri).rstrip("/")
+        return path_target == uri_target
+    else:
+        assert uri.startswith(LOCAL_URI_PREFIX)
+        return is_same_path(path, file_uri_to_path(uri))
+
+
+def file_uri_to_path(uri: str) -> str:
+    if uri.startswith(LOCAL_URI_PREFIX):
+        path = uri[len(LOCAL_URI_PREFIX) :]
+    elif uri.startswith(REMOTE_URI_PREFIX):
+        path = uri[len(REMOTE_URI_PREFIX) :]
+    else:
+        raise ValueError(f"Unknown URI scheme {uri}")
+
+    if path.startswith("/") and uri[1:2].isalpha() and uri[2:3] == ":":
+        # Windows path
+        path = path[1:]  # remove leading slash
+        path = path.replace("/", "\\")
+
+    return urllib.parse.unquote(path)
 
 
 def export_distributions_info_from_dir(dir_path: str) -> List[DistInfo]:
@@ -903,3 +922,60 @@ def export_distributions_info(dists: Iterable, assume_pypi: bool) -> List[DistIn
         )
         for dist in dists
     ]
+
+
+def try_get_base_executable(executable: str) -> Optional[str]:
+    if os.path.islink(executable):
+        # a venv executable may link to another venv executable
+        return try_get_base_executable(os.path.realpath(executable))
+
+    may_be_venv_exe = False
+    for location in ["..", "."]:
+        cfg_path = os.path.join(os.path.dirname(executable), location, "pyvenv.cfg")
+
+        if not os.path.isfile(cfg_path):
+            continue
+
+        may_be_venv_exe = True
+
+        atts = {}
+        with open(cfg_path) as fp:
+            for line in fp:
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", maxsplit=1)
+                atts[key.strip()] = value.strip()
+
+        if "home" not in atts:
+            logger.warning("No home in %s", cfg_path)
+            continue
+
+        if "executable" in atts:
+            # venv-s starting with Python 3.11
+            return atts["executable"]
+
+        if "base-executable" in atts:
+            # virtualenv-s starting with ???
+            return atts["base-executable"]
+
+    # pyvenv.cfg may be present also in non-virtual envs.
+    # I can check for this in certain case
+    if (
+        may_be_venv_exe
+        and os.path.samefile(sys.executable, executable)
+        and sys.prefix == sys.base_prefix
+    ):
+        may_be_venv_exe = False
+
+    if may_be_venv_exe:
+        # should only happen with venv-s before Python 3.11 or with uv
+        # as Python 3.11 started recording executable in pyvenv.cfg
+        logger.warning("Could not find base executable of %s", executable)
+        return None
+    else:
+        return executable
+
+
+def extract_target_path(s) -> str:
+    assert is_remote_path(s)
+    return s[s.find(REMOTE_PATH_MARKER) + len(REMOTE_PATH_MARKER) :]

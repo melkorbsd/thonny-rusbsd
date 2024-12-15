@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from logging import getLogger
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from thonny.languages import tr
 
@@ -600,6 +600,44 @@ def download_and_parse_json(url: str, timeout: int = 10) -> Any:
     return json.loads(download_bytes(url, timeout=timeout))
 
 
+def post_and_return_stream(
+    url: str, data: Any, headers: Dict[str, Any] = {}, timeout: int = 10
+) -> Any:
+    import json
+    from urllib.request import Request, urlopen
+
+    if not isinstance(data, bytes):
+        if isinstance(data, str):
+            data = data.encode(encoding="utf-8")
+        else:
+            data = json.dumps(data).encode(encoding="utf-8")
+
+    req = Request(url, headers={key: str(value) for key, value in headers.items()})
+
+    return urlopen(req, data=data, timeout=timeout)
+
+
+def post_and_parse_json(
+    url: str, data: Any, headers: Dict[str, Any] = {}, timeout: int = 10
+) -> Any:
+    import json
+
+    resp = post_and_return_stream(
+        url, data=data, headers={key: str(value) for key, value in headers.items()}, timeout=timeout
+    )
+    return json.load(resp)
+
+
+def get_and_parse_json(url: str, headers: Dict[str, Any] = {}, timeout: int = 10) -> Any:
+    import json
+    from urllib.request import Request, urlopen
+
+    req = Request(url, headers=headers)
+
+    resp = urlopen(req, timeout=timeout)
+    return json.load(resp)
+
+
 def get_os_level_favorite_folders() -> List[str]:
     if running_on_windows():
         raise NotImplementedError()
@@ -727,3 +765,8 @@ def _compute_date_format_with_month_abbrev():
         return f"{month_fmt} {day_fmt}"
     else:
         return f"{day_fmt} {month_fmt}"
+
+
+def version_str_to_tuple_of_ints(s: str) -> Tuple[int]:
+    parts = s.split(".")
+    return tuple([int(part) for part in parts if part.isnumeric()])

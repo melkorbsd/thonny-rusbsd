@@ -5,7 +5,7 @@ import textwrap
 import tkinter as tk
 from logging import getLogger
 from tkinter import ttk
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import thonny
 from thonny import get_runner, get_shell, get_workbench, ui_utils
@@ -18,10 +18,10 @@ from thonny.common import (
     InlineCommand,
     InlineResponse,
     ToplevelCommand,
-    get_base_executable,
     is_private_python,
     normpath_with_actual_case,
     running_in_virtual_environment,
+    try_get_base_executable,
 )
 from thonny.languages import tr
 from thonny.misc_utils import running_on_mac_os, running_on_windows
@@ -36,13 +36,19 @@ logger = getLogger(__name__)
 class LocalCPythonProxy(SubprocessProxy):
     def __init__(self, clean: bool) -> None:
         logger.info("Creating LocalCPythonProxy")
-        executable = get_workbench().get_option("LocalCPython.executable")
         self._expecting_response_for_gui_update = False
-        super().__init__(clean, executable)
+        super().__init__(clean)
         try:
             self._send_msg(ToplevelCommand("get_environment_info"))
         except Exception:
             get_shell().report_exception()
+
+    def compute_mgmt_executable(self):
+        return get_workbench().get_option("LocalCPython.executable")
+
+    def get_mgmt_executable_validation_error(self) -> Optional[str]:
+        if not os.path.isfile(self._mgmt_executable):
+            return f"Interpreter {self._mgmt_executable!r} not found.\nPlease select another!"
 
     def _get_initial_cwd(self):
         return get_workbench().get_local_cwd()
@@ -93,7 +99,7 @@ class LocalCPythonProxy(SubprocessProxy):
     def get_executable(self):
         return self._reported_executable
 
-    def get_base_executable(self):
+    def get_base_executable(self) -> Optional[str]:
         return self._reported_base_executable
 
     def _update_gui_updating(self, msg):
@@ -150,7 +156,7 @@ class LocalCPythonProxy(SubprocessProxy):
                 self._proc.send_signal(signal.SIGINT)
 
     def run_script_in_terminal(self, script_path, args, interactive, keep_open):
-        cmd = [self._mgmt_executable]
+        cmd = [self._mgmt_executable] + self.get_mgmt_executable_special_switches()
         if interactive:
             cmd.append("-i")
         cmd.append(os.path.basename(script_path))
@@ -205,7 +211,7 @@ class LocalCPythonProxy(SubprocessProxy):
         return cls.backend_description + "  •  " + exe_label
 
     @classmethod
-    def get_switcher_entries(cls):
+    def get_switcher_entries(cls) -> List[Tuple[Dict[str, Any], str, str]]:
         confs = sorted(
             cls.get_last_configurations(), key=lambda conf: conf[f"{cls.backend_name}.executable"]
         )
@@ -215,7 +221,7 @@ class LocalCPythonProxy(SubprocessProxy):
             confs.insert(0, default_conf)
 
         return [
-            (conf, cls.get_switcher_configuration_label(conf))
+            (conf, cls.get_switcher_configuration_label(conf), "localhost")
             for conf in confs
             if os.path.exists(conf[f"{cls.backend_name}.executable"])
         ]
@@ -356,11 +362,17 @@ class LocalCPythonConfigurationPage(TabbedBackendDetailsConfigurationPage):
     def should_restart(self, changed_options: List[str]):
         return "LocalCPython.executable" in changed_options
 
+    def get_new_machine_id(self) -> str:
+        return "localhost"
+
 
 def get_default_cpython_executable_for_backend() -> str:
     if is_private_python(sys.executable) and running_in_virtual_environment():
         # Private venv. Make an exception and use base Python for default backend.
-        default_path = get_base_executable()
+        default_path = try_get_base_executable(sys.executable)
+        if default_path is None:
+            logger.warning("Could not find base executable of %s", sys.executable)
+            default_path = sys.executable
     else:
         default_path = sys.executable.replace("pythonw.exe", "python.exe")
 

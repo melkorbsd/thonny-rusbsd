@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 import os.path
+import pathlib
 import re
-import sys
+import time
 import tkinter as tk
-import traceback
 from _tkinter import TclError
 from logging import exception, getLogger
 from tkinter import messagebox, simpledialog, ttk
 from typing import Literal, Optional, Union
 
-from thonny import get_runner, get_workbench, ui_utils
+from thonny import get_runner, get_workbench
 from thonny.base_file_browser import ask_backend_path, choose_node_for_file_operations
 from thonny.codeview import BinaryFileException, CodeView, CodeViewText
 from thonny.common import (
@@ -17,6 +17,7 @@ from thonny.common import (
     InlineCommand,
     TextRange,
     ToplevelResponse,
+    extract_target_path,
     is_local_path,
     is_remote_path,
     is_same_path,
@@ -25,21 +26,28 @@ from thonny.common import (
 )
 from thonny.custom_notebook import CustomNotebook, CustomNotebookPage, CustomNotebookTab
 from thonny.languages import tr
+from thonny.lsp_proxy import LanguageServerProxy
+from thonny.lsp_types import (
+    DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams,
+    Position,
+    Range,
+    RangedTextDocumentContentChangeEvent,
+    TextDocumentIdentifier,
+    TextDocumentItem,
+    VersionedTextDocumentIdentifier,
+)
 from thonny.misc_utils import running_on_mac_os, running_on_windows
 from thonny.tktextext import rebind_control_a
-from thonny.ui_utils import (
-    askopenfilename,
-    asksaveasfilename,
-    get_beam_cursor,
-    select_sequence,
-    windows_known_extensions_are_hidden,
-)
+from thonny.ui_utils import askopenfilename, asksaveasfilename, get_beam_cursor, select_sequence
 
 PYTHON_FILES_STR = tr("Python files")
-_dialog_filetypes = [(PYTHON_FILES_STR, ".py .pyw .pyi"), (tr("all files"), ".*")]
+_dialog_filetypes = [(PYTHON_FILES_STR, ".py .pyw .pyi .pyde"), (tr("all files"), ".*")]
 
-PYTHON_EXTENSIONS = {"py", "pyw", "pyi"}
+PYTHON_EXTENSIONS = {"py", "pyw", "pyi", "pyde"}
 PYTHONLIKE_EXTENSIONS = set()
+DEBOUNCE_SECONDS = 0.5
 
 logger = getLogger(__name__)
 
@@ -74,6 +82,7 @@ class BaseEditor(ttk.Frame):
         self.rowconfigure(0, weight=1)
 
         self._filename = None
+        self._file_source = None
 
     def update_appearance(self):
         self._code_view.set_gutter_visibility(
@@ -136,25 +145,36 @@ class BaseEditor(ttk.Frame):
 class Editor(BaseEditor):
     def __init__(self, master):
         assert isinstance(master, EditorNotebook)
+        self._ls_proxy: Optional[LanguageServerProxy] = None
         self.containing_notebook = master  # type: EditorNotebook
         super().__init__(master, propose_remove_line_numbers=True)
         get_workbench().event_generate(
             "EditorTextCreated", editor=self, text_widget=self.get_text_widget()
         )
 
+        self._last_change_time: float = 0
+        self._unpublished_incremental_changes = []
+        self._content_at_server: Optional[str] = None  # for validating incremental updates
+
+        self._last_published_version: Optional[int] = None
+
         self._last_known_mtime = None
 
         self._code_view.text.bind("<<Modified>>", self._on_text_modified, True)
         self._code_view.text.bind("<<TextChange>>", self._on_text_change, True)
         self._code_view.text.bind("<Control-Tab>", self._control_tab, True)
+        get_workbench().bind("TextInsert", self._register_text_change, True)
+        get_workbench().bind("TextDelete", self._register_text_change, True)
 
         get_workbench().bind("DebuggerResponse", self._listen_debugger_progress, True)
         get_workbench().bind("ToplevelResponse", self._listen_for_toplevel_response, True)
+        get_workbench().bind("LanguageServerInitialized", self._language_server_initialized, True)
+        get_workbench().bind("LanguageServerInvalidated", self._language_server_invalidated, True)
 
         self.update_appearance()
 
-    def get_content(self) -> str:
-        return self._code_view.get_content()
+    def get_content(self, up_to_end=False) -> str:
+        return self._code_view.get_content(up_to_end=up_to_end)
 
     def set_filename(self, path):
         self._filename = path
@@ -170,6 +190,9 @@ class Editor(BaseEditor):
             return self._filename
         else:
             return str(self.winfo_id())
+
+    def get_file_source(self):
+        return self._file_source
 
     def check_for_external_changes(self):
         if self._filename is None:
@@ -244,8 +267,8 @@ class Editor(BaseEditor):
                 result = self._load_remote_file(filename)
             else:
                 result = self._load_local_file(filename, keep_undo)
-                if not result:
-                    return False
+            if not result:
+                return False
         except BinaryFileException:
             messagebox.showerror(
                 tr("Problem"), tr("%s doesn't look like a text file") % (filename,), master=self
@@ -263,7 +286,9 @@ class Editor(BaseEditor):
             )
             return False
 
+        self._try_connect_to_language_server()
         self.update_appearance()
+        self._update_file_source()
         return True
 
     def _load_local_file(self, filename, keep_undo=False):
@@ -366,6 +391,7 @@ class Editor(BaseEditor):
             self.update_title()
             get_workbench().event_generate("Saved", editor=self, filename=self._filename)
 
+        self._update_file_source()
         return save_filename
 
     def write_local_file(self, save_filename, content_bytes, save_copy):
@@ -536,6 +562,13 @@ class Editor(BaseEditor):
     def show(self):
         self.master.select(self)
 
+    def close(self):
+        if self._ls_proxy is not None:
+            self._ls_proxy.notify_did_close_text_document(
+                DidCloseTextDocumentParams(TextDocumentIdentifier(uri=self.get_uri()))
+            )
+        self.destroy()
+
     def _listen_debugger_progress(self, event):
         # Go read-only
         # TODO: check whether this module is active?
@@ -593,6 +626,18 @@ class Editor(BaseEditor):
         if self.containing_notebook.has_content(self):
             self.update_title()
 
+    def _register_text_change(self, event):
+        if self._code_view.text is not event["text_widget"]:
+            return
+
+        self._last_change_time = time.time()
+
+        if self._last_published_version is not None:
+            # meaning the changes should be collected
+            self._unpublished_incremental_changes.append(event)
+
+            self.after(int(DEBOUNCE_SECONDS * 1000), self._consider_sending_changes_to_server)
+
     def destroy(self):
         get_workbench().unbind("DebuggerResponse", self._listen_debugger_progress)
         get_workbench().unbind("ToplevelResponse", self._listen_for_toplevel_response)
@@ -618,6 +663,150 @@ class Editor(BaseEditor):
                 return path
 
         return path
+
+    def _update_file_source(self):
+        if is_remote_path(self._filename):
+            proxy = get_runner().get_backend_proxy()
+            if proxy is not None:
+                self._file_source = get_runner().get_backend_proxy().get_machine_id()
+            else:
+                logger.warning("update_file_source: no proxy, leaving as is")
+        else:
+            self._file_source = "-"  # should not match any machine id
+
+    def _language_server_initialized(self, lsp: LanguageServerProxy) -> None:
+        self._try_connect_to_language_server()
+
+    def _language_server_invalidated(self, lsp: LanguageServerProxy) -> None:
+        self._ls_proxy = None
+
+    def _try_connect_to_language_server(self):
+        if not is_local_path(self._filename):
+            # TODO
+            return
+
+        current_ls_proxy = get_workbench().get_language_server_proxy()
+        if self._ls_proxy == current_ls_proxy:
+            return
+
+        if current_ls_proxy is None:
+            logger.warning("Missed earlier language server invalidation, doing it now")
+            self._ls_proxy = None
+            return
+
+        logger.info(f"Connecting {self._filename} to language server")
+        version = 1
+        current_content = self.get_content(up_to_end=True)
+        current_ls_proxy.notify_did_open_text_document(
+            DidOpenTextDocumentParams(
+                textDocument=TextDocumentItem(
+                    version=version,
+                    uri=self.get_uri(),
+                    text=current_content,
+                    languageId=self.get_language_id(),
+                )
+            )
+        )
+        get_workbench().event_generate("AfterSendingDocumentUpdates", path=self.get_filename())
+        self._last_published_version = version
+        self._ls_proxy = current_ls_proxy
+        self._unpublished_incremental_changes = []
+        self._content_at_server = current_content
+
+    def _consider_sending_changes_to_server(self, event=None):
+        time_since_last_change = time.time() - self._last_change_time
+
+        if time_since_last_change >= DEBOUNCE_SECONDS:
+            self.send_changes_to_language_server()
+        else:
+            wait_time = DEBOUNCE_SECONDS - time_since_last_change
+            self.after(int(wait_time * 1000), self._consider_sending_changes_to_server)
+
+    def send_changes_to_language_server(self) -> None:
+        if not self._unpublished_incremental_changes:
+            return
+
+        logger.debug("Merging changes from %s events", len(self._unpublished_incremental_changes))
+        clean_prefix_end_line = 9999999999  # lines before this line have not been modified
+        clean_suffix_start_line = -1  # this line and lines after this have not been modified
+        line_count_delta = 0
+
+        for change in self._unpublished_incremental_changes:
+            if change["sequence"] == "TextInsert":
+                insertion_line = int(float(change["index"]))
+                num_lines_added = change["text"].count("\n")
+
+                clean_prefix_end_line = min(clean_prefix_end_line, insertion_line)
+                clean_suffix_start_line = (
+                    max(clean_suffix_start_line, insertion_line + 1) + num_lines_added
+                )
+
+                line_count_delta += num_lines_added
+            else:
+                assert change["sequence"] == "TextDelete"
+                del_start_line = int(float(change["index1"]))
+                del_end_line = int(float(change["index2"]))
+                num_lines_deleted = del_end_line - del_start_line
+
+                clean_prefix_end_line = min(clean_prefix_end_line, del_start_line)
+                clean_suffix_start_line = (
+                    max(clean_suffix_start_line, del_start_line + 1) - num_lines_deleted
+                )
+
+                line_count_delta -= num_lines_deleted
+
+        # LSP uses 0-based line numbers, hence -1
+        orig_zero_based_range_start_line = clean_prefix_end_line - 1
+        orig_zero_based_range_end_line = clean_suffix_start_line - line_count_delta - 1
+        replacement_text = self.get_text_widget().get(
+            f"{clean_prefix_end_line}.0", f"{clean_suffix_start_line}.0"
+        )
+
+        # validate
+        lines_at_server = self._content_at_server.splitlines(keepends=True)
+        unmodified_prefix = "".join(lines_at_server[:orig_zero_based_range_start_line])
+        unmodified_suffix = "".join(lines_at_server[orig_zero_based_range_end_line:])
+        assembled_content = unmodified_prefix + replacement_text + unmodified_suffix
+
+        current_content = self.get_content(up_to_end=True)
+        if assembled_content != current_content:
+            raise RuntimeError(
+                f"Assembled content doesn't match actual content:"
+                f" {assembled_content!r} vs {current_content!r}"
+            )
+
+        version = self._last_published_version + 1
+        self._ls_proxy.notify_did_change_text_document(
+            DidChangeTextDocumentParams(
+                textDocument=VersionedTextDocumentIdentifier(version=version, uri=self.get_uri()),
+                contentChanges=[
+                    RangedTextDocumentContentChangeEvent(
+                        range=Range(
+                            start=Position(line=orig_zero_based_range_start_line, character=0),
+                            end=Position(line=orig_zero_based_range_end_line, character=0),
+                        ),
+                        text=replacement_text,
+                    )
+                ],
+            )
+        )
+        get_workbench().event_generate("AfterSendingDocumentUpdates", path=self.get_filename())
+        self._last_published_version = version
+        self._unpublished_incremental_changes = []
+        self._content_at_server = assembled_content
+
+    def get_language_id(self) -> str:
+        return "python"  # TODO
+
+    def get_uri(self) -> Optional[str]:
+        if self._filename is None:
+            return None
+
+        elif is_local_path(self._filename):
+            return pathlib.Path(self._filename).as_uri()
+
+        # TODO
+        raise NotImplementedError("Remote paths not supported yet")
 
 
 class EditorNotebook(CustomNotebook):
@@ -801,18 +990,20 @@ class EditorNotebook(CustomNotebook):
         else:
             filenames = []
 
+        shown_files_count = 0
         if len(filenames) > 0:
             for filename in filenames:
                 if os.path.exists(filename):
                     self.show_file(filename)
+                    shown_files_count += 1
 
             cur_file = get_workbench().get_option("file.current_file")
             # choose correct active file
             if cur_file and os.path.exists(cur_file):
                 self.show_file(cur_file)
-            else:
-                self._cmd_new_file()
-        else:
+                shown_files_count += 1
+
+        if shown_files_count == 0:
             self._cmd_new_file()
 
     def save_all_named_editors(self):
@@ -935,7 +1126,7 @@ class EditorNotebook(CustomNotebook):
         if not force and not self.check_allow_closing(editor):
             return
         self.forget(editor)
-        editor.destroy()
+        editor.close()
 
     def _cmd_save_file(self):
         if self.get_current_editor():
@@ -1219,6 +1410,46 @@ class EditorNotebook(CustomNotebook):
             "RemoveEditorFromNotebook", pos=pos, editor=editor, text_widget=editor.get_text_widget()
         )
 
+    def try_close_remote_files_from_another_machine(
+        self, dialog_parent, new_machine_id: str
+    ) -> bool:
+        all_remote_editors_to_be_closed = []
+        modified_remote_editors_to_be_closed = []
+        modified_remote_files_to_be_closed = []
+        for editor in self.get_all_editors():
+            if editor.get_file_source() == new_machine_id:
+                continue
+
+            filename = editor.get_filename()
+            if filename is not None and is_remote_path(filename):
+                all_remote_editors_to_be_closed.append(editor)
+                if editor.is_modified():
+                    modified_remote_editors_to_be_closed.append(editor)
+                    modified_remote_files_to_be_closed.append(extract_target_path(filename))
+
+        if len(modified_remote_files_to_be_closed) > 0:
+            message = (
+                tr("All files from %s will be closed before switching the interpreter.")
+                % get_runner().get_node_label()
+            ) + "\n\n"
+            message += tr("Unsaved changes to the following files will be lost:") + "\n"
+            message += "\n • " + "\n • ".join(modified_remote_files_to_be_closed)
+            message += "\n\n" + tr("Do you still want to continue?")
+
+            confirm = messagebox.askyesno(
+                title=tr("Discard unsaved changes?"),
+                message=message,
+                default=messagebox.NO,
+                master=dialog_parent,
+            )
+            if not confirm:
+                return False
+
+        for editor in all_remote_editors_to_be_closed:
+            self.close_editor(editor, force=True)
+
+        return True
+
 
 def get_current_breakpoints():
     result = {}
@@ -1253,11 +1484,6 @@ def get_target_dirname_from_editor_filename(s):
         return os.path.dirname(s)
     else:
         return universal_dirname(extract_target_path(s))
-
-
-def extract_target_path(s):
-    assert is_remote_path(s)
-    return s[s.find(REMOTE_PATH_MARKER) + len(REMOTE_PATH_MARKER) :]
 
 
 def make_remote_path(target_path):

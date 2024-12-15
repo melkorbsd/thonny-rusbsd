@@ -50,7 +50,7 @@ _mp_lib_metadata_cache = None
 class MicroPythonProxy(SubprocessProxy):
     def __init__(self, clean):
         self._lib_dirs = []
-        super().__init__(clean, running.get_front_interpreter_for_subprocess())
+        super().__init__(clean)
 
     def get_packages_target_dir_with_comment(self) -> Tuple[Optional[str], Optional[str]]:
         lib_dirs = self.get_lib_dirs()
@@ -301,12 +301,17 @@ class MicroPythonProxy(SubprocessProxy):
 
         return dist_info
 
+    def needs_disconnect_button(self):
+        return True
+
 
 class BareMetalMicroPythonProxy(MicroPythonProxy):
     def __init__(self, clean):
         self._port = get_workbench().get_option(self.backend_name + ".port")
+        self._machine_id = None  # will be set later
         if self._port == "auto":
             # may come from pre-Thonny 5 configuration file
+            logger.warning("Ignoring 'auto' port")
             self._port = None
         self._clean_start = clean
 
@@ -325,13 +330,16 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
         logger.info(
             "Starting background process (BareMetal), clean: %r, extra_args: %r", clean, extra_args
         )
-        # if self._port is None:
-        #    return
 
         # refresh the ports cache, so that the next uncached request (in BackendRestart handler)
         # is less likely to race with the back-end process trying to open a port and getting a
         # PermissionError (has happened in Windows)
         list_serial_ports(max_cache_age=0, skip_logging=False)
+
+        # also, look up and remember the serial number of the device.
+        # Luckily, the port info cache has been just refreshed, so it will be quick
+        self._machine_id = get_machine_id_for_current_conf(self.backend_name)
+
         super()._start_background_process(clean=clean, extra_args=extra_args)
 
     def _get_launcher_with_args(self):
@@ -500,6 +508,9 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
 
     def disconnect(self):
         self.destroy()
+        self._show_error(
+            "\nDisconnected.\n\nClick ☐ at the bottom of the window or use Stop/Restart to reconnect."
+        )
 
     def get_node_label(self):
         if "CircuitPython" in self._welcome_text:
@@ -571,7 +582,7 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
                 return f"{cls.backend_description}  •  {port}"
 
     @classmethod
-    def get_switcher_entries(cls):
+    def get_switcher_entries(cls) -> List[Tuple[Dict[str, Any], str, str]]:
         def should_show(conf):
             port = conf[f"{cls.backend_name}.port"]
             if port == "auto":
@@ -595,7 +606,14 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
                 relevant_confs.append(conf)
 
         sorted_confs = sorted(relevant_confs, key=cls.get_switcher_configuration_label)
-        return [(conf, cls.get_switcher_configuration_label(conf)) for conf in sorted_confs]
+        return [
+            (
+                conf,
+                cls.get_switcher_configuration_label(conf),
+                get_machine_id_for_conf(cls.backend_name, conf),
+            )
+            for conf in sorted_confs
+        ]
 
     def has_custom_system_shell(self):
         return self._port and self._port != WEBREPL_PORT_VALUE
@@ -637,6 +655,9 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
 
     def can_install_packages_from_files(self) -> bool:
         return True
+
+    def get_machine_id(self) -> str:
+        return self._machine_id
 
 
 class BareMetalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
@@ -1092,9 +1113,12 @@ class BareMetalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
     def should_restart(self, changed_options: List[str]):
         return self._connection_is_modified() or self._has_opened_python_flasher
 
-    def apply(self, changed_options: List[str]):
+    def get_new_machine_id(self) -> str:
+        return get_machine_id_for_current_conf(self.backend_name)
+
+    def apply(self, changed_options: List[str]) -> bool:
         if not self._connection_is_modified():
-            return
+            return True
 
         else:
             port_name = self.get_selected_port_name()
@@ -1112,6 +1136,8 @@ class BareMetalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
                 get_workbench().set_option(
                     self.backend_name + ".webrepl_password", self._webrepl_password_var.get()
                 )
+
+        return True
 
     def destroy(self):
         if self._port_polling_after_id is not None:
@@ -1262,13 +1288,13 @@ class LocalMicroPythonProxy(MicroPythonProxy):
         )
 
     @classmethod
-    def get_switcher_entries(cls):
+    def get_switcher_entries(cls) -> List[Tuple[Dict[str, Any], str, str]]:
         confs = sorted(
             cls.get_last_configurations(), key=lambda conf: conf[f"{cls.backend_name}.executable"]
         )
 
         return [
-            (conf, cls.get_switcher_configuration_label(conf))
+            (conf, cls.get_switcher_configuration_label(conf), "localhost")
             for conf in confs
             if os.path.exists(conf[f"{cls.backend_name}.executable"])
             or shutil.which(conf[f"{cls.backend_name}.executable"])
@@ -1299,6 +1325,9 @@ class LocalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
 
     def should_restart(self, changed_options: List[str]):
         return "LocalMicroPython.executable" in changed_options
+
+    def get_new_machine_id(self) -> str:
+        return "localhost"
 
 
 class SshMicroPythonProxy(MicroPythonProxy):
@@ -1415,9 +1444,12 @@ class SshMicroPythonProxy(MicroPythonProxy):
         return f"{cls.backend_description}  •  {user} @ {host} : {executable}"
 
     @classmethod
-    def get_switcher_entries(cls):
+    def get_switcher_entries(cls) -> List[Tuple[Dict[str, Any], str, str]]:
         confs = sorted(cls.get_last_configurations(), key=cls.get_switcher_configuration_label)
-        return [(conf, cls.get_switcher_configuration_label(conf)) for conf in confs]
+        return [
+            (conf, cls.get_switcher_configuration_label(conf), conf[cls.backend_name + ".host"])
+            for conf in confs
+        ]
 
     def has_custom_system_shell(self):
         return True
@@ -1443,6 +1475,9 @@ class SshMicroPythonProxy(MicroPythonProxy):
     def can_install_packages_from_files(self) -> bool:
         return False
 
+    def get_machine_id(self) -> str:
+        return self._host
+
 
 class SshMicroPythonConfigPage(BaseSshProxyConfigPage):
     pass
@@ -1464,6 +1499,25 @@ def get_serial_port_label(p) -> str:
     desc = desc.replace("\x00", "").strip()
 
     return f"{desc} @ {p.device}"
+
+
+def get_machine_id_for_current_conf(backend_name: str) -> str:
+    conf = {}
+    for name in ["port", "webrepl_url"]:
+        key = backend_name + "." + name
+        conf[key] = get_workbench().get_option(key)
+    return get_machine_id_for_conf(backend_name, conf)
+
+
+def get_machine_id_for_conf(backend_name: str, conf: Dict[str, Any]) -> str:
+    port = conf[backend_name + ".port"]
+    if port == WEBREPL_PORT_VALUE:
+        return get_workbench().get_option(conf[backend_name + ".webrepl_url"])
+    try:
+        return get_port_info(port).serial_number
+    except Exception:
+        logger.exception("Could not get port_info for %r", port)
+        return "<unknown>"
 
 
 def list_serial_ports(max_cache_age: float = 0.5, skip_logging: bool = False):
@@ -1502,14 +1556,6 @@ def _list_serial_ports_uncached(skip_logging: bool = False):
         os.path.islink = old_islink
         if not skip_logging:
             logger.info("Done listing serial ports")
-
-
-def port_exists(device):
-    for port in list_serial_ports():
-        if port.device == device:
-            return True
-
-    return False
 
 
 def get_uart_adapter_vids_pids():

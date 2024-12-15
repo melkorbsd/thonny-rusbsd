@@ -252,9 +252,6 @@ class ActiveLocalFileBrowser(BaseLocalFileBrowser):
                     if fnam == CFGFILE:
                         return os.path.dirname(path)
         except Exception:
-            import traceback
-
-            traceback.print_stack()
             logger.exception("_get_venv_path")
 
     def check_for_venv(self):
@@ -626,16 +623,29 @@ def load_plugin() -> None:
         ".py",
         ".pyw",
         ".pyi",
+        ".pyde",
         ".txt",
         ".log",
         ".json",
+        ".jsonl",
         ".yml",
         ".yaml",
         ".md",
         ".rst",
         ".toml",
+        ".tex",
         ".gitignore",
         ".env",
+        ".cfg",
+        ".lock",
+        ".python-version",
+        ".html",
+        ".htm",
+        ".js",
+        ".ts",
+        ".sh",
+        ".bat",
+        ".csv",
     ]:
         get_workbench().set_default(get_file_handler_conf_key(ext), "thonny")
 

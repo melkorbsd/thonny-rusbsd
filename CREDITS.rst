@@ -68,6 +68,7 @@ Source contributors, sponsors, advisors, translators and frequent bug-reporters
 * Austin Bart
 * Avag. sayan
 * badukaire
+* BBTF GmbH (bbtf.de)
 * @bletvaska
 * @bmcage
 * Bui Huy Quang
@@ -115,6 +116,7 @@ Source contributors, sponsors, advisors, translators and frequent bug-reporters
 * jharris1993
 * Juan Falgueras
 * Juhan Oskar Hennoste (@FeldrinH)
+* Jon Peterson
 * Jonathan Campbell
 * Jordan Williams
 * jose1711
@@ -122,6 +124,7 @@ Source contributors, sponsors, advisors, translators and frequent bug-reporters
 * Karolina Surma (@befeleme)
 * Kaspar Papli
 * Kauri Raba
+* @kemelzaidan
 * kr-g
 * Laszlo Kocsis
 * Louis Lenchant
@@ -148,12 +151,14 @@ Source contributors, sponsors, advisors, translators and frequent bug-reporters
 * Radim
 * Ralf Michael Metzing
 * @rauferd
+* @razzius
 * Rene Lehtma
 * Richard Kanehl
 * Rune Langøy
 * Saishen, Inc.
 * Sam Warmuth
 * Sami Almuhammady
+* S Jonkers
 * sailslack
 * Scott Blackledge
 * @scottfp
