@@ -155,6 +155,7 @@ Source contributors, sponsors, advisors, translators and frequent bug-reporters
 * Rene Lehtma
 * Richard Kanehl
 * Rune Langøy
+* Russell Taber
 * Saishen, Inc.
 * Sam Warmuth
 * Sami Almuhammady
@@ -173,6 +174,7 @@ Source contributors, sponsors, advisors, translators and frequent bug-reporters
 * Suk-Hyung Hwang
 * Sven Duzont
 * Syed Nasim
+* @t2solve
 * Taavi Ilp
 * tabreturn
 * TANAKA Masayuki
