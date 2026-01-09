@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import _thread
 import io
 import os.path
 import pathlib
@@ -9,7 +8,6 @@ import sys
 import threading
 import time
 import traceback
-import warnings
 from abc import ABC, abstractmethod
 from logging import getLogger
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -32,11 +30,9 @@ from thonny.common import (  # TODO: try to get rid of this
     ToplevelResponse,
     UserError,
     execute_with_frontend_sys_path,
-    is_local_path,
     parse_message,
     read_one_incoming_message_str,
     serialize_message,
-    try_load_modules_with_frontend_sys_path,
     universal_dirname,
 )
 
@@ -51,9 +47,10 @@ class BaseBackend(ABC):
 
     def __init__(self):
         self._current_command = None
+        self._current_command_interrupt_event = None
         self._incoming_message_queue = queue.Queue()  # populated by the reader thread
         self._interrupt_lock = threading.Lock()
-        self._last_progress_reporting_time = 0
+        self._last_progress_reporting_time: float = 0
         self._last_sent_output = ""
         self._init_command_reader()
 
@@ -85,6 +82,7 @@ class BaseBackend(ABC):
                         self._handle_eof_command(msg)
                     else:
                         self._current_command = msg
+                        self._current_command_interrupt_event = threading.Event()
                         self._handle_normal_command(msg)
         except KeyboardInterrupt:
             self._send_output("\nKeyboardInterrupt", "stderr")
@@ -115,7 +113,10 @@ class BaseBackend(ABC):
         sys.exit(ALL_EXPLAINED_STATUS_CODE)
 
     def _current_command_is_interrupted(self):
-        return getattr(self._current_command, "interrupted", False)
+        return (
+            self._current_command_interrupt_event is not None
+            and self._current_command_interrupt_event.is_set()
+        )
 
     def _fetch_next_incoming_message(self, timeout=None):
         return self._incoming_message_queue.get(timeout=timeout)
@@ -255,7 +256,6 @@ class MainBackend(BaseBackend, ABC):
 
     def __init__(self):
         self._command_handlers = {}
-        self._jedi_is_loaded = False
         BaseBackend.__init__(self)
 
     def add_command(self, command_name, handler):
@@ -265,13 +265,6 @@ class MainBackend(BaseBackend, ABC):
         or a BackendResponse
         """
         self._command_handlers[command_name] = handler
-
-    def send_message(self, msg: MessageFromBackend) -> None:
-        super().send_message(msg)
-
-        # take the time for pre-loading jedi after the first toplevel response
-        if isinstance(msg, ToplevelResponse):
-            self._check_load_jedi()
 
     def _handle_normal_command(self, cmd: CommandToBackend) -> None:
         assert isinstance(cmd, (ToplevelCommand, InlineCommand))
@@ -304,7 +297,7 @@ class MainBackend(BaseBackend, ABC):
                     response = {}
                 else:
                     response = {"error": "Interrupted", "interrupted": True}
-            except Exception as e:
+            except Exception:
                 logger.exception("Exception while handling %r", cmd.name)
                 self._report_internal_exception("Exception while handling %r" % cmd.name)
                 sys.exit(ALL_EXPLAINED_STATUS_CODE)
@@ -333,150 +326,14 @@ class MainBackend(BaseBackend, ABC):
         """Returns info about all items under and including cmd.paths"""
         return {"all_items": self._get_paths_info(cmd.source_paths, recurse=True)}
 
-    def _cmd_shell_autocomplete(self, cmd):
-        error = None
-        try:
-            from thonny import jedi_utils
-        except ImportError:
-            completions = []
-            error = "Could not import jedi"
-        else:
-            import __main__
+    @abstractmethod
+    def _cmd_get_active_distributions(self, cmd) -> Dict[str, Any]: ...
 
-            with warnings.catch_warnings():
-                completions = jedi_utils.get_interpreter_completions(
-                    cmd.source, [__main__.__dict__], sys_path=self._get_sys_path_for_analysis()
-                )
+    @abstractmethod
+    def _cmd_install_distributions(self, cmd) -> Dict[str, Any]: ...
 
-        return dict(
-            source=cmd.source,
-            completions=completions,
-            error=error,
-            row=cmd.row,
-            column=cmd.column,
-        )
-
-    def _cmd_editor_autocomplete(self, cmd):
-        logger.debug("Starting _cmd_editor_autocomplete")
-        error = None
-        try:
-            from thonny import jedi_utils
-
-            sys_path = self._get_sys_path_for_analysis()
-
-            # add current dir for local files
-            """
-            if cmd.filename and is_local_path(cmd.filename):
-                sys_path.insert(0, os.getcwd())
-                logger.debug("editor autocomplete with %r", sys_path)
-            """
-
-            with warnings.catch_warnings():
-                completions = jedi_utils.get_script_completions(
-                    cmd.source,
-                    cmd.row,
-                    cmd.column,
-                    cmd.filename,
-                    sys_path=sys_path,
-                )
-        except ImportError:
-            completions = []
-            error = "Could not import jedi"
-
-        return dict(
-            source=cmd.source,
-            row=cmd.row,
-            column=cmd.column,
-            filename=cmd.filename,
-            completions=completions,
-            error=error,
-        )
-
-    def _cmd_get_completion_details(self, cmd):
-        # it is assumed this gets called after requesting editor or shell completions
-        from thonny import jedi_utils
-
-        return InlineResponse(
-            "get_completion_details",
-            full_name=cmd.full_name,
-            details=jedi_utils.get_completion_details(cmd.full_name),
-        )
-
-    def _cmd_get_editor_calltip(self, cmd):
-        from thonny import jedi_utils
-
-        signatures = jedi_utils.get_script_signatures(
-            cmd.source,
-            cmd.row,
-            cmd.column,
-            cmd.filename,
-            sys_path=self._get_sys_path_for_analysis(),
-        )
-        return InlineResponse(
-            "get_editor_calltip",
-            source=cmd.source,
-            row=cmd.row,
-            column=cmd.column,
-            filename=cmd.filename,
-            signatures=signatures,
-        )
-
-    def _cmd_get_shell_calltip(self, cmd):
-        import __main__
-        from thonny import jedi_utils
-
-        signatures = jedi_utils.get_interpreter_signatures(
-            cmd.source, [__main__.__dict__], sys_path=self._get_sys_path_for_analysis()
-        )
-        return InlineResponse(
-            "get_shell_calltip",
-            source=cmd.source,
-            row=cmd.row,
-            column=cmd.column,
-            filename=cmd.filename,
-            signatures=signatures,
-        )
-
-    def _cmd_highlight_occurrences(self, cmd):
-        from thonny import jedi_utils
-
-        refs = jedi_utils.get_references(
-            cmd.source,
-            cmd.row,
-            cmd.column,
-            cmd.filename,
-            scope="file",
-            sys_path=self._get_sys_path_for_analysis(),
-        )
-
-        return {"references": refs, "text_last_operation_time": cmd.text_last_operation_time}
-
-    def _cmd_get_definitions(self, cmd):
-        from thonny import jedi_utils
-
-        defs = jedi_utils.get_definitions(
-            cmd.source,
-            cmd.row,
-            cmd.column,
-            filename=cmd.filename,
-            sys_path=self._get_sys_path_for_analysis(),
-        )
-        return {"definitions": defs}
-
-    def _cmd_get_active_distributions(self, cmd):
-        raise NotImplementedError()
-
-    def _cmd_get_installed_distribution_metadata(self, cmd):
-        raise NotImplementedError()
-
-    def _cmd_install_distributions(self, cmd):
-        raise NotImplementedError()
-
-    def _cmd_uninstall_distributions(self, cmd):
-        raise NotImplementedError()
-
-    def _get_sys_path_for_analysis(self) -> Optional[List[str]]:
-        return None
+    @abstractmethod
+    def _cmd_uninstall_distributions(self, cmd) -> Dict[str, Any]: ...
 
     def _get_paths_info(self, paths: List[str], recurse: bool) -> Dict[str, Dict]:
         result = {}
@@ -499,6 +356,7 @@ class MainBackend(BaseBackend, ABC):
         """Assumes path is dir. Dict is keyed by full path"""
         result = {}
         children_info = self._get_filtered_dir_children_info(path, include_hidden)
+        assert children_info is not None
         for child_name, child_info in children_info.items():
             full_child_path = path + self._get_sep() + child_name
             result[full_child_path] = child_info
@@ -531,16 +389,6 @@ class MainBackend(BaseBackend, ABC):
     @abstractmethod
     def _get_sep(self) -> str:
         """Returns symbol for combining parent directory path and child name"""
-
-    def _check_load_jedi(self) -> None:
-        if self._jedi_is_loaded:
-            return
-        logger.info("Loading Jedi")
-
-        report_time("Before loading Jedi")
-        try_load_modules_with_frontend_sys_path(["jedi", "parso"])
-        self._jedi_is_loaded = True
-        report_time("After loading Jedi")
 
 
 class UploadDownloadMixin(ABC):
@@ -694,8 +542,7 @@ class UploadDownloadMixin(ABC):
         """returns None if path doesn't exist"""
 
     @abstractmethod
-    def _mkdir_for_upload(self, path: str) -> None:
-        raise NotImplementedError()
+    def _mkdir_for_upload(self, path: str) -> None: ...
 
     @abstractmethod
     def _write_file(
@@ -705,24 +552,20 @@ class UploadDownloadMixin(ABC):
         file_size: int,
         callback: Callable[[int, int], None],
         make_shebang_scripts_executable: bool,
-    ) -> None:
-        raise NotImplementedError()
+    ) -> None: ...
 
     @abstractmethod
     def _read_file(
         self, source_path: str, target_fp: BinaryIO, callback: Callable[[int, int], None]
-    ) -> None:
-        raise NotImplementedError()
+    ) -> None: ...
 
     @abstractmethod
-    def _report_internal_exception(self):
-        raise NotImplementedError()
+    def _report_internal_exception(self, msg: str) -> None: ...
 
     @abstractmethod
     def _report_progress(
         self, cmd, description: Optional[str], value: float, maximum: float
-    ) -> None:
-        raise NotImplementedError()
+    ) -> None: ...
 
     def _read_file_return_bytes(self, source_path: str) -> bytes:
         def callback(x, y):
@@ -763,13 +606,14 @@ class RemoteProcess:
 
 
 class SshMixin(UploadDownloadMixin):
-    def __init__(self, host, user, password, interpreter, cwd):
+    def __init__(self, host, port, user, password, interpreter, cwd):
         # UploadDownloadMixin.__init__(self)
         execute_with_frontend_sys_path(self._try_load_paramiko)
         import paramiko
-        from paramiko.client import AutoAddPolicy, SSHClient
+        from paramiko.client import SSHClient
 
         self._host = host
+        self._port = port
         self._user = user
         self._password = password
         self._target_interpreter = interpreter
@@ -785,6 +629,8 @@ class SshMixin(UploadDownloadMixin):
     def _try_load_paramiko(self):
         try:
             import paramiko.client
+
+            logger.debug("Could import %", paramiko.client)
         except ImportError:
             logger.info("Could not import paramiko")
             print(
@@ -800,6 +646,7 @@ class SshMixin(UploadDownloadMixin):
         try:
             self._client.connect(
                 hostname=self._host,
+                port=int(self._port) if self._port else 22,
                 username=self._user,
                 password=self._password,
                 passphrase=self._password,
@@ -878,7 +725,9 @@ class SshMixin(UploadDownloadMixin):
             import paramiko
 
             # TODO: does it get closed properly after process gets killed?
-            self._sftp = paramiko.SFTPClient.from_transport(self._client.get_transport())
+            transport = self._client.get_transport()
+            assert transport is not None
+            self._sftp = paramiko.SFTPClient.from_transport(transport)
 
         return self._sftp
 
@@ -926,7 +775,7 @@ class SshMixin(UploadDownloadMixin):
     def _get_stat_mode_for_upload(self, path: str) -> Optional[int]:
         try:
             return self._perform_sftp_operation_with_retry(lambda sftp: sftp.stat(path).st_mode)
-        except OSError as e:
+        except OSError:
             return None
 
     def _mkdir_for_upload(self, path: str) -> None:

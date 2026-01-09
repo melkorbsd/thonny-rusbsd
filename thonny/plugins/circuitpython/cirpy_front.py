@@ -1,3 +1,4 @@
+import os.path
 from logging import getLogger
 from typing import List, Optional
 
@@ -90,6 +91,10 @@ class CircuitPythonProxy(BareMetalMicroPythonProxy):
             return True
 
         return "CircuitPython CDC " in (p.interface or "")
+
+    @classmethod
+    def get_vendored_user_stubs_ids(cls) -> List[str]:
+        return ["circuitpython-typeshed"]
 
 
 class CircuitPythonConfigPage(BareMetalMicroPythonConfigPage):

@@ -9,14 +9,10 @@ import dataclasses
 import os.path
 import site
 import sys
-import urllib.parse
 from collections import namedtuple
 from dataclasses import dataclass
 from logging import getLogger
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple  # @UnusedImport
-
-REMOTE_URI_PREFIX = "vscode-remote://"
-LOCAL_URI_PREFIX = "file://"
+from typing import Any, Callable, Dict, Iterable, List, Optional  # @UnusedImport
 
 logger = getLogger(__name__)
 
@@ -25,11 +21,10 @@ REPL_PSEUDO_FILENAME = "<stdin>"
 MESSAGE_MARKER = "\x02"
 OBJECT_LINK_START = "[object_link_for_thonny=%d]"
 OBJECT_LINK_END = "[/object_link_for_thonny]"
-REMOTE_PATH_MARKER = " :: "
 PROCESS_ACK = "OK"
 ALL_EXPLAINED_STATUS_CODE = 193
 
-NBSP = "\u00A0"
+NBSP = "\u00a0"
 
 IGNORED_FILES_AND_DIRS = [
     "System Volume Information",
@@ -69,7 +64,7 @@ TextRange = namedtuple("TextRange", ["lineno", "col_offset", "end_lineno", "end_
 @dataclass(frozen=True)
 class DistInfo:
     name: str
-    version: str
+    version: Optional[str]
     summary: Optional[str] = None
     license: Optional[str] = None
     author: Optional[str] = None
@@ -125,7 +120,7 @@ class Record:
     def __eq__(self, other):
         # pylint: disable=unidiomatic-typecheck
 
-        if type(self) != type(other):
+        if type(self) is type(other):
             return False
 
         if len(self.__dict__) != len(other.__dict__):
@@ -137,7 +132,7 @@ class Record:
             self_value = getattr(self, key)
             other_value = getattr(other, key)
 
-            if type(self_value) != type(other_value) or self_value != other_value:
+            if type(self_value) is type(other_value) or self_value != other_value:
                 return False
 
         return True
@@ -260,7 +255,7 @@ def serialize_message(msg: Record, max_line_length=65536) -> str:
     # default (safe) window size in Paramiko (https://github.com/thonny/thonny/issues/1680)
     msg_str = ascii(msg)
 
-    lines = []
+    lines: List[str] = []
     for i in range(0, len(msg_str), max_line_length):
         lines.append(msg_str[i : i + max_line_length])
 
@@ -270,7 +265,7 @@ def serialize_message(msg: Record, max_line_length=65536) -> str:
 def parse_message(msg_string: str) -> Record:
     # DataFrames may have nan
     # pylint: disable=unused-variable
-    nan = float("nan")  # @UnusedVariable
+    locals()["nan"] = float("nan")
     assert msg_string[0] == MESSAGE_MARKER
     assert msg_string.strip().endswith(")")
     msg_start = msg_string.index(" ")
@@ -289,7 +284,7 @@ def normpath_with_actual_case(name: str) -> str:
             # https://stackoverflow.com/questions/2113822/python-getting-filename-case-as-stored-in-windows/2114975
             norm_name = os.path.normpath(name)
 
-            from ctypes import create_unicode_buffer, windll
+            from ctypes import create_unicode_buffer, windll  # type: ignore
 
             buf = create_unicode_buffer(512)
             # GetLongPathNameW alone doesn't fix filename part
@@ -385,14 +380,10 @@ def get_site_dir(symbolic_name, executable=None):
     else:
         import subprocess
 
-        result = (
-            subprocess.check_output(
-                [executable, "-m", "site", "--" + symbolic_name.lower().replace("_", "-")],
-                universal_newlines=True,
-            )
-            .decode()
-            .strip()
-        )
+        result = subprocess.check_output(
+            [executable, "-m", "site", "--" + symbolic_name.lower().replace("_", "-")],
+            universal_newlines=True,
+        ).strip()
 
     return result if result else None
 
@@ -421,45 +412,6 @@ def update_system_path(env, value):
             env["PATH"] = value
     else:
         env["PATH"] = value
-
-
-@dataclass
-class SignatureParameter:
-    kind: str
-    name: str
-    annotation: Optional[str]
-    default: Optional[str]
-
-
-@dataclass
-class SignatureInfo:
-    name: str
-    params: List[SignatureParameter]
-    return_type: Optional[str]
-    current_param_index: Optional[int] = None
-    call_bracket_start: Optional[Tuple[int, int]] = None
-
-
-@dataclass
-class CompletionInfo:
-    name: str
-    name_with_symbols: str
-    full_name: str
-    type: str
-    prefix_length: int  # the number of chars to be deleted before inserting name
-    signatures: Optional[List[SignatureInfo]]
-    docstring: Optional[str]
-    module_name: Optional[str]
-    module_path: Optional[str]
-
-
-@dataclass
-class NameReference:
-    module_name: str
-    module_path: str
-    row: int
-    column: int
-    length: int
 
 
 class UserError(RuntimeError):
@@ -498,7 +450,7 @@ def get_single_dir_child_data(path: str, include_hidden: bool = False) -> Option
             return get_single_dir_child_data("/", include_hidden)
 
     elif os.path.isdir(path) or os.path.ismount(path):
-        result = {}
+        result: Dict[str, Any] = {}
 
         try:
             for child in os.listdir(path):
@@ -533,7 +485,7 @@ def get_windows_volumes_info():
     # http://stackoverflow.com/a/2288225/261181
     # http://msdn.microsoft.com/en-us/library/windows/desktop/aa364939%28v=vs.85%29.aspx
     import string
-    from ctypes import windll
+    from ctypes import windll  # type: ignore
 
     all_drive_types = [
         "DRIVE_UNKNOWN",
@@ -595,7 +547,7 @@ def get_windows_volume_name(path):
     # https://stackoverflow.com/a/12056414/261181
     import ctypes
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.windll.kernel32  # type: ignore
     volume_name_buffer = ctypes.create_unicode_buffer(1024)
     file_system_name_buffer = ctypes.create_unicode_buffer(1024)
     serial_number = None
@@ -625,7 +577,7 @@ def get_windows_network_locations():
     CSIDL_NETHOOD = 0x13
     SHGFP_TYPE_CURRENT = 0
     buf = ctypes.create_unicode_buffer(ctypes.wintypes.MAX_PATH)
-    ctypes.windll.shell32.SHGetFolderPathW(0, CSIDL_NETHOOD, 0, SHGFP_TYPE_CURRENT, buf)
+    ctypes.windll.shell32.SHGetFolderPathW(0, CSIDL_NETHOOD, 0, SHGFP_TYPE_CURRENT, buf)  # type: ignore
     shortcuts_dir = buf.value
     if not buf.value:
         logger.warning("Could not determine windows shortcuts directory")
@@ -671,7 +623,7 @@ def execute_system_command(cmd, cwd=None, disconnect_stdin=False):
     # Make sure this python interpreter and its scripts are available
     # in PATH
     update_system_path(env, get_augmented_system_path(get_exe_dirs()))
-    popen_kw = dict(
+    popen_kw: Dict[str, Any] = dict(
         env=env,
         universal_newlines=True,
         bufsize=0,
@@ -683,9 +635,8 @@ def execute_system_command(cmd, cwd=None, disconnect_stdin=False):
     if disconnect_stdin:
         popen_kw["stdin"] = subprocess.DEVNULL
 
-    if sys.version_info >= (3, 6):
-        popen_kw["errors"] = "replace"
-        popen_kw["encoding"] = encoding
+    popen_kw["errors"] = "replace"
+    popen_kw["encoding"] = encoding
 
     if isinstance(cmd.cmd_line, str) and cmd.cmd_line.startswith("!"):
         cmd_line = cmd.cmd_line[1:]
@@ -799,46 +750,6 @@ def is_private_python(executable):
 
 def running_in_virtual_environment() -> bool:
     return sys.base_prefix != sys.prefix
-
-
-def is_remote_path(s: str) -> bool:
-    return REMOTE_PATH_MARKER in s
-
-
-def is_local_path(s: str) -> bool:
-    return not is_remote_path(s) and not s.startswith("<")
-
-
-def editor_path_matches_uri(path: Optional[str], uri: str) -> bool:
-    if path is None:
-        return False
-
-    if is_remote_path(path):
-        if not uri.startswith(REMOTE_URI_PREFIX):
-            return False
-
-        path_target = extract_target_path(path).rstrip("/")
-        uri_target = file_uri_to_path(uri).rstrip("/")
-        return path_target == uri_target
-    else:
-        assert uri.startswith(LOCAL_URI_PREFIX)
-        return is_same_path(path, file_uri_to_path(uri))
-
-
-def file_uri_to_path(uri: str) -> str:
-    if uri.startswith(LOCAL_URI_PREFIX):
-        path = uri[len(LOCAL_URI_PREFIX) :]
-    elif uri.startswith(REMOTE_URI_PREFIX):
-        path = uri[len(REMOTE_URI_PREFIX) :]
-    else:
-        raise ValueError(f"Unknown URI scheme {uri}")
-
-    if path.startswith("/") and uri[1:2].isalpha() and uri[2:3] == ":":
-        # Windows path
-        path = path[1:]  # remove leading slash
-        path = path.replace("/", "\\")
-
-    return urllib.parse.unquote(path)
 
 
 def export_distributions_info_from_dir(dir_path: str) -> List[DistInfo]:
@@ -974,8 +885,3 @@ def try_get_base_executable(executable: str) -> Optional[str]:
         return None
     else:
         return executable
-
-
-def extract_target_path(s) -> str:
-    assert is_remote_path(s)
-    return s[s.find(REMOTE_PATH_MARKER) + len(REMOTE_PATH_MARKER) :]

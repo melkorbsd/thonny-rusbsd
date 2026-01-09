@@ -1,5 +1,8 @@
 """
 Downloads: https://adafruit-circuit-python.s3.amazonaws.com/index.html?prefix=bin/
+Interesting:
+    https://raw.githubusercontent.com/adafruit/circuitpython-org/main/_data/files.json
+    https://circuitpython.org/api/boards.json
 """
 
 from html.parser import HTMLParser
@@ -15,7 +18,7 @@ from update_variants_common import get_attr_value, save_variants
 
 base_url = "https://circuitpython.org/downloads"
 
-PREV_RELEVANT_VERSION = "9.1.4"
+PREV_RELEVANT_VERSION = "9.2.9"
 RELEVANT_FAMILIES = {
     "atmel-samd",
     "esp32",
@@ -25,8 +28,10 @@ RELEVANT_FAMILIES = {
     "esp32c3",
     "esp32c6",
     "esp32h2",
+    "esp32p4",
     "nrf52840",
-    "raspberrypi",
+    "rp2040",
+    "rp2350",
 }
 
 DAPLINK_BOARDS = {"microbit_v2", "makerdiary_nrf52840_mdk"}
@@ -83,7 +88,7 @@ for i, variant in enumerate(all_variants):
         prev_major_url = f"https://downloads.circuitpython.org/bin/{variant['_id']}/en_US/adafruit-circuitpython-{variant['_id']}-en_US-{PREV_RELEVANT_VERSION}.{extension}"
         add_download_link_if_exists(variant["downloads"], prev_major_url, PREV_RELEVANT_VERSION)
 
-    if variant["family"] == "raspberrypi":
+    if variant["family"] in ["rp2040", "rp2350"]:
         variant["family"] = "rp2"
     elif variant["family"].startswith("nrf52"):
         variant["family"] = "nrf52"

@@ -3,17 +3,25 @@
 import dataclasses
 import inspect
 import json
+import os.path
 import subprocess
+import sys
 import threading
 import time
 import typing
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, is_dataclass
-from enum import Enum, StrEnum
+from dataclasses import is_dataclass
+from enum import Enum
 from logging import getLogger
 from queue import Queue
-from turtledemo.penrose import start
-from types import NoneType, UnionType
+
+if sys.version_info >= (3, 10):
+    from types import NoneType, UnionType
+else:
+    # For Python < 3.10, use the built-in type(None) instead of NoneType
+    NoneType = type(None)
+    from typing import Union as UnionType
+
 from typing import (
     Any,
     Callable,
@@ -27,8 +35,9 @@ from typing import (
     get_type_hints,
 )
 
-from thonny import get_workbench, lsp_types
+from thonny import get_thonny_user_dir, get_workbench, lsp_types
 from thonny.lsp_types import (
+    DidChangeConfigurationParams,
     ErrorCodes,
     InitializedParams,
     InitializeResult,
@@ -41,14 +50,6 @@ JSON_RPC_LEN_HEADER_PREFIX = b"Content-Length: "
 JSON_RPC_TYPE_HEADER_PREFIX = b"Content-Type: "
 
 logger = getLogger(__name__)
-
-
-@dataclass
-class CompletionParams:
-    pass
-
-
-METHOD_PARAMS_AND_RESPONSES = {"textDocument/completion": (CompletionParams,)}
 
 
 class ResponseException(RuntimeError):
@@ -68,6 +69,9 @@ class JsonRpcError(RuntimeError):
 
 class LanguageServerProxy(ABC):
     def __init__(self, initialize_params: lsp_types.InitializeParams):
+        if os.path.exists(self._get_communication_log_path()):
+            os.remove(self._get_communication_log_path())
+
         self._proc: Optional[subprocess.Popen] = None
         self._invalidated: bool = False
         self._shutdown_accepted: bool = False
@@ -86,11 +90,20 @@ class LanguageServerProxy(ABC):
         self._keep_processing_messages_from_server()
         threading.Thread(target=self._listen_stdout, daemon=True).start()
         threading.Thread(target=self._listen_stderr, daemon=True).start()
+
         logger.info("Initializing language server")
+        if isinstance(initialize_params, dict):
+            initialize_params["initializationOptions"] = self.get_settings()
+        else:
+            assert isinstance(initialize_params, lsp_types.InitializeParams)
+            initialize_params.initializationOptions = self.get_settings()
         self._request_initialize(initialize_params, self._handle_initialize_response)
 
         # keep the cache of latest diagnostics TODO: do I need it?
         self.bind_publish_diagnostics(self._collect_diagnostics)
+
+        # TODO: not really required, but let it be, maybe it becomes handy later
+        self.bind_configuration(self._handle_configuration)
 
     @abstractmethod
     def _create_server_process(self) -> subprocess.Popen[bytes]: ...
@@ -107,11 +120,16 @@ class LanguageServerProxy(ABC):
 
         get_workbench().event_generate("LanguageServerInitialized", self)
 
-    def is_ready(self) -> bool:
+        # Specifying settings as initializationOptions is not enough
+        self.notify_workspace_did_change_configuration(
+            DidChangeConfigurationParams(settings=self.get_settings())
+        )
+
+    def is_initialized(self) -> bool:
         return self._server_process_alive() and self.server_capabilities is not None
 
-    def _check_ready(self) -> None:
-        if not self.is_ready():
+    def _check_initialized(self) -> None:
+        if not self.is_initialized():
             if not self._server_process_alive():
                 raise RuntimeError("Server has been closed")
 
@@ -122,6 +140,9 @@ class LanguageServerProxy(ABC):
         if not self._invalidated:
             self._invalidated = True
             get_workbench().event_generate("LanguageServerInvalidated", self)
+
+    def get_settings(self) -> Dict:
+        return {}
 
     def shut_down(self):
         self._invalidate()
@@ -179,6 +200,28 @@ class LanguageServerProxy(ABC):
 
     def _collect_diagnostics(self, result: PublishDiagnosticsParams):
         self._diagnostics[result.uri] = result
+
+    def _handle_configuration(self, params: lsp_types.ConfigurationParams) -> Any:
+        logger.info("Configuration request: %r", params)
+        result = []
+        settings = self.get_settings()
+        for item in params.items:
+            result.append(self._extract_settings(settings, item.section))
+
+        return result
+
+    def _extract_settings(self, block: Dict, section: str) -> Dict:
+        if "." in section:
+            head, tail = section.split(".", maxsplit=1)
+            if head in block:
+                return self._extract_settings(block[head], tail)
+            else:
+                return {}
+        else:
+            if section in block:
+                return block[section]
+            else:
+                return {}
 
     def _request_initialize(
         self,
@@ -1026,7 +1069,7 @@ class LanguageServerProxy(ABC):
         self, method: str, params: Any, handler: Callable[[LspResponse[Any]], None]
     ) -> None:
         if method != "initialize":
-            self._check_ready()
+            self._check_initialized()
 
         request_id = self._last_request_id + 1
         self._last_request_id = request_id
@@ -1041,7 +1084,7 @@ class LanguageServerProxy(ABC):
         )
 
     def _send_notification(self, method: str, params: Any) -> None:
-        self._check_ready()
+        self._check_initialized()
 
         self._send_json_rpc_message(
             {"jsonrpc": "2.0", "method": method, "params": _convert_to_json_value(params)}
@@ -1050,7 +1093,7 @@ class LanguageServerProxy(ABC):
     def _send_response(
         self, request_id: Union[str, int], result: Any, error: Optional[ResponseError] = None
     ) -> None:
-        self._check_ready()
+        self._check_initialized()
 
         msg = {
             "jsonrpc": "2.0",
@@ -1063,8 +1106,10 @@ class LanguageServerProxy(ABC):
         self._send_json_rpc_message(msg)
 
     def _send_json_rpc_message(self, msg: Dict) -> None:
+        if get_workbench().in_debug_mode():
+            self._add_to_communication_log(msg, "CLIENT")
         json_bytes = json.dumps(msg).encode("utf-8")
-        print("SEnding", json_bytes)
+        # print("SEnding", json_bytes)
         self._proc.stdin.write(JSON_RPC_LEN_HEADER_PREFIX)
         self._proc.stdin.write(str(len(json_bytes)).encode("utf-8"))
         self._proc.stdin.write(b"\r\n\r\n")
@@ -1096,6 +1141,8 @@ class LanguageServerProxy(ABC):
 
     def _handle_message_from_server(self, msg: Dict) -> None:
         logger.debug("Handling message from server: %r", msg)
+        if get_workbench().in_debug_mode():
+            self._add_to_communication_log(msg, "SERVER")
         method = msg.get("method")
         result = msg.get("result")
         error = msg.get("error")
@@ -1161,6 +1208,18 @@ class LanguageServerProxy(ABC):
         for handler in self._notification_handlers.get(method, []):
             expected_params_type = _get_function_arg_type(handler)
             handler(_convert_from_json_value(params, expected_params_type))
+
+    def _get_communication_log_path(self) -> str:
+        return os.path.join(get_thonny_user_dir(), f"lsp_communication_{type(self).__name__}.log")
+
+    def _add_to_communication_log(self, msg: Dict, sender: str) -> None:
+        with open(self._get_communication_log_path(), mode="ta") as fp:
+            fp.write(f"[[[ FROM {sender} ]]]\n")
+            fp.write(json.dumps(msg, indent=4, sort_keys=True))
+            fp.write("\n")
+
+    @abstractmethod
+    def get_supported_language_ids(self) -> typing.Set[str]: ...
 
 
 def _read_json_rpc_message(proc: subprocess.Popen) -> Optional[Dict]:

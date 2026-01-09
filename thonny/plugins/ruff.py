@@ -1,5 +1,5 @@
 import subprocess
-from typing import List
+import typing
 
 from thonny import get_workbench
 from thonny.lsp_proxy import LanguageServerProxy
@@ -17,6 +17,9 @@ class RuffProxy(LanguageServerProxy):
             universal_newlines=False,
         )
 
+    def get_supported_language_ids(self) -> typing.Set[str]:
+        return {"python"}
+
 
 def load_plugin():
-    get_workbench().add_language_server_proxy("Ruff", RuffProxy)
+    get_workbench().add_language_server_proxy_class(RuffProxy)

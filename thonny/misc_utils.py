@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import datetime
 import os.path
+import pathlib
 import platform
 import queue
 import shlex
@@ -10,14 +10,34 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from logging import getLogger
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import unquote
 
+from thonny import get_runner
 from thonny.languages import tr
 
 PASSWORD_METHOD = "password"
 PUBLIC_KEY_NO_PASS_METHOD = "public-key (without passphrase)"
 PUBLIC_KEY_WITH_PASS_METHOD = "public-key (with passphrase)"
+
+FILE_URI_SCHEME: str = "file"
+REMOTE_URI_SCHEME: str = "remote"
+UNTITLED_URI_SCHEME: str = "untitled"
+PLACEHOLDER_URI = f"{UNTITLED_URI_SCHEME}:0"
+
+REMOTE_PATH_MARKER = " :: "
+
+PROJECT_MARKERS = [
+    "pyproject.toml",
+    "setup.cfg",
+    "setup.py",
+    ".python-version",
+    "Pipfile",
+    "package.json",
+]
+
 
 logger = getLogger(__name__)
 
@@ -459,7 +479,7 @@ def sizeof_fmt(num, suffix="B"):
     """Readable file size
     :param num: Bytes value
     :type num: int
-    :param suffix: Unit suffix (optionnal) default = B
+    :param suffix: Unit suffix (optional) default = B
     :type suffix: str
     :rtype: str
     """
@@ -717,3 +737,169 @@ def _compute_date_format_with_month_abbrev():
 def version_str_to_tuple_of_ints(s: str) -> Tuple[int]:
     parts = s.split(".")
     return tuple([int(part) for part in parts if part.isnumeric()])
+
+
+def uri_to_target_path(uri: str) -> str:
+    parts = urllib.parse.urlsplit(uri)
+    if parts.scheme == UNTITLED_URI_SCHEME:
+        raise ValueError("Can't get path of untitled uri")
+
+    elif parts.scheme == FILE_URI_SCHEME:
+        if parts.netloc:
+            # assuming Windows UNC
+            return f"//{parts.netloc}{unquote(parts.path)}"
+
+        path = unquote(parts.path)
+        if path.startswith("/") and path[2:3] == ":":
+            # Windows path
+            return path[1:].replace("/", "\\")
+        else:
+            return path
+
+    elif parts.scheme == REMOTE_URI_SCHEME:
+        return unquote(parts.path)
+
+    else:
+        raise ValueError(f"Unsupported URI scheme '{parts.scheme}'")
+
+
+def legacy_remote_filename_to_target_path(s) -> str:
+    assert is_legacy_remote_filename(s)
+    return s[s.find(REMOTE_PATH_MARKER) + len(REMOTE_PATH_MARKER) :]
+
+
+def is_legacy_remote_filename(s: str) -> bool:
+    return REMOTE_PATH_MARKER in s
+
+
+def is_local_path(s: str) -> bool:
+    return (
+        not is_legacy_remote_filename(s)
+        and not s.startswith("<")
+        and (s.startswith("/") or s[1:3] == ":\\")
+    )
+
+
+def uri_to_legacy_filename(uri: str) -> str:
+    """Returns 'blah :: /path/file' for remote files, as was common in Thonny 4"""
+    if is_remote_uri(uri):
+        return make_legacy_remote_path(uri_to_target_path(uri))
+    else:
+        return uri_to_target_path(uri)
+
+
+def ensure_uri(filename_or_uri: str) -> str:
+    if is_legacy_remote_filename(filename_or_uri):
+        return legacy_filename_to_uri(filename_or_uri)
+    elif is_local_path(filename_or_uri):
+        return local_path_to_uri(filename_or_uri)
+    elif ":" in filename_or_uri:
+        return filename_or_uri
+    else:
+        raise ValueError(f"Can't understand filename or uri: {filename_or_uri!r}")
+
+
+def legacy_filename_to_uri(filename: str) -> str:
+    if is_legacy_remote_filename(filename):
+        return remote_path_to_uri(legacy_remote_filename_to_target_path(filename))
+    else:
+        return local_path_to_uri(filename)
+
+
+def uri_to_long_title(uri: str) -> str:
+    if is_untitled_uri(uri):
+        return format_untitled_uri(uri)
+    elif is_remote_uri(uri):
+        return make_legacy_remote_path(uri_to_target_path(uri))
+    elif is_local_uri(uri):
+        return uri_to_target_path(uri)
+    else:
+        raise ValueError(f"Unexpected uri: {uri}")
+
+
+def local_path_to_uri(path: str) -> str:
+    if path.startswith("//"):
+        # UNC
+        return f"{FILE_URI_SCHEME}:{urllib.parse.quote(path)}"
+    elif path[1:3] == ":\\":
+        # Regular Windows path, needs special treatment on other platforms
+        return pathlib.PureWindowsPath(path).as_uri()
+    else:
+        assert path.startswith("/")
+        return f"{FILE_URI_SCHEME}://{urllib.parse.quote(path)}"
+
+
+def remote_path_to_uri(path: str) -> str:
+    assert path.startswith("/")
+    return f"{REMOTE_URI_SCHEME}://netloc{urllib.parse.quote(path)}"
+
+
+def is_untitled_uri(uri: str) -> bool:
+    return uri.startswith(UNTITLED_URI_SCHEME + ":")
+
+
+def is_local_uri(uri: str) -> bool:
+    """Whether the file is "local" in the sense that it can be read and written with
+    simple open-call. Includes UNC files in Windows (???)"""
+    return uri.startswith(FILE_URI_SCHEME + ":")
+
+
+def is_remote_uri(uri: str) -> bool:
+    return uri.startswith(REMOTE_URI_SCHEME + ":")
+
+
+def is_editor_supported_uri(uri: str) -> bool:
+    return is_local_uri(uri) or is_remote_uri(uri) or is_untitled_uri(uri)
+
+
+def format_untitled_uri(uri: str) -> str:
+    return tr("<untitled>")
+
+
+def make_legacy_remote_path(target_path):
+    return get_runner().get_node_label() + REMOTE_PATH_MARKER + target_path
+
+
+def is_local_project_dir(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+
+    for marker in PROJECT_MARKERS:
+        if os.path.exists(os.path.join(path, marker)):
+            return True
+
+    return False
+
+
+def is_local_venv_dir(path: str) -> bool:
+    if not os.path.isdir(path):
+        return False
+
+    return os.path.isfile(os.path.join(path, "pyvenv.cfg"))
+
+
+def get_project_venv_interpreters(project_path: str) -> List[str]:
+    if not os.path.isdir(project_path):
+        return []
+
+    # TODO: try find Pyenv, Pipenv and Poetry interpreters
+
+    name_ranking = [".venv", "venv", ".env"]
+
+    exe_candidates = []
+    for name in os.listdir(project_path):
+        venv_candidate = os.path.join(project_path, name)
+        if ("venv" in name or ".env" in name) and is_local_venv_dir(venv_candidate):
+            if os.name == "nt":
+                exe_candidate = os.path.join(venv_candidate, "Scripts", "python.exe")
+            else:
+                exe_candidate = os.path.join(venv_candidate, "bin", "python")
+
+            if os.path.isfile(exe_candidate):
+                if name in name_ranking:
+                    rank = name_ranking.index(name)
+                else:
+                    rank = 10
+                exe_candidates.append((rank, exe_candidate))
+
+    return [candidate for _, candidate in sorted(exe_candidates)]

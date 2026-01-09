@@ -1,19 +1,10 @@
 import tkinter as tk
-import traceback
 from logging import getLogger
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple
 
 from thonny import get_workbench, lsp_types
 from thonny.codeview import CodeViewText, SyntaxText, get_syntax_options_for_tag
-from thonny.common import SignatureInfo, SignatureParameter
-from thonny.editors import Editor
-from thonny.lsp_types import (
-    CompletionItem,
-    CompletionItemKind,
-    MarkupContent,
-    MarkupKind,
-    SignatureInformation,
-)
+from thonny.lsp_types import CompletionItem, MarkupContent, MarkupKind
 from thonny.misc_utils import running_on_mac_os
 from thonny.shell import ShellText
 from thonny.tktextext import TextFrame
@@ -96,7 +87,7 @@ class EditorInfoBox(tk.Toplevel):
         #    return
 
         # Need to close when another app or a Thonny's dialog appears
-        # (othewise the box will float above this, at least in Linux).
+        # (otherwise the box will float above this, at least in Linux).
         # Don't do anything if another EditorInfoBox appears
         for box in all_boxes:
             try:
@@ -274,19 +265,13 @@ def get_cursor_position(text: SyntaxText) -> Tuple[int, int]:
     return int(parts[0]), int(parts[1])
 
 
-def get_text_filename(text: SyntaxText) -> Optional[str]:
-    if isinstance(text, ShellText):
-        return "<Shell>"
-    elif isinstance(text, CodeViewText):
-        editor = text.master.master
-        if isinstance(editor, Editor):
-            return editor.get_filename()
-
-    return None
-
-
-def get_cursor_ls_position(text: SyntaxText) -> lsp_types.Position:
+def get_cursor_ls_position(
+    text: SyntaxText, cursor_line_offset: int = 0, cursor_column_offset: int = 0
+) -> lsp_types.Position:
     row, col = get_cursor_position(text)
+    row += cursor_line_offset
+    col += cursor_column_offset
+
     # TODO: convert char position to UFT-16 items
     logger.warning("NB! convert to UTF-16 points")
     return lsp_types.Position(line=row - 1, character=col)

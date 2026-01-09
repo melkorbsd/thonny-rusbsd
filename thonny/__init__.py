@@ -1,10 +1,10 @@
 import logging
 import os.path
+import re
 import sys
 import time
-import re
 from logging import getLogger
-from typing import TYPE_CHECKING, List, Optional, cast
+from typing import TYPE_CHECKING, cast
 
 SUPPORTED_VERSIONS = ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
@@ -52,9 +52,11 @@ _last_module_count = 0
 _last_modules = set()
 _last_time = time.time()
 
+
 def remove_weird_characters(input_string: str) -> str:
-    cleaned_string = re.sub(r'[^a-z]', '', input_string)
+    cleaned_string = re.sub(r"[^a-z]", "", input_string)
     return cleaned_string
+
 
 def report_time(label: str) -> None:
     """
@@ -90,7 +92,9 @@ def get_version():
     if _version:
         return _version
     try:
-        package_dir = os.path.dirname(sys.modules["thonny"].__file__)
+        thonny_file = sys.modules["thonny"].__file__
+        assert thonny_file is not None
+        package_dir = os.path.dirname(thonny_file)
         with open(os.path.join(package_dir, "VERSION"), encoding="ASCII") as fp:
             _version = fp.read().strip()
             return _version
@@ -248,7 +252,11 @@ def configure_backend_logging() -> None:
 
 
 def get_backend_log_file():
-    return os.path.join(get_thonny_user_dir(), "backend.log")
+    file_name = "backend.log"
+    if any(var in os.environ for var in ["SSH_CLIENT", "SSH_TTY", "SSH_CONNECTION"]):
+        file_name = "ssh_" + file_name
+
+    return os.path.join(get_thonny_user_dir(), file_name)
 
 
 def configure_logging(log_file, console_level=None):
@@ -261,10 +269,10 @@ def configure_logging(log_file, console_level=None):
 
     main_logger = logging.getLogger("thonny")
     contrib_logger = logging.getLogger("thonnycontrib")
-    pipkin_logger = logging.getLogger("pipkin")
+    minny_logger = logging.getLogger("minny")
 
     # NB! Don't mess with the main root logger, because (CPython) backend runs user code
-    for logger in [main_logger, contrib_logger, pipkin_logger]:
+    for logger in [main_logger, contrib_logger, minny_logger]:
         logger.setLevel(choose_logging_level())
         logger.propagate = False  # otherwise it will be also reported by IDE-s root logger
         logger.addHandler(file_handler)
@@ -279,16 +287,22 @@ def configure_logging(log_file, console_level=None):
     # Log most important info as soon as possible
     main_logger.info("Thonny version: %s", get_version())
     main_logger.info("cwd: %s", os.getcwd())
-    main_logger.info("original argv: %s", _get_orig_argv())
+    main_logger.info("original argv: %s", sys.orig_argv)
     main_logger.info("sys.executable: %s", sys.executable)
     main_logger.info("sys.argv: %s", sys.argv)
     main_logger.info("sys.path: %s", sys.path)
     main_logger.info("sys.flags: %s", sys.flags)
 
     import faulthandler
+    import signal
 
-    fault_out = open(os.path.join(get_thonny_user_dir(), "frontend_faults.log"), mode="w")
+    fault_out = open(
+        os.path.join(get_thonny_user_dir(), "frontend_faults.log"), mode="w", buffering=1
+    )
     faulthandler.enable(fault_out)
+    if sys.platform != "win32":
+        faulthandler.register(signal.SIGUSR1, file=fault_out, all_threads=True)
+        # for getting traces of hung process, on macOS invoke  "kill -USR1 <pid>" and then "kill -USR2 <pid>"
 
 
 def get_user_base_directory_for_plugins() -> str:
@@ -366,31 +380,3 @@ def _read_configured_debug_mode():
 
         traceback.print_exc()
         return False
-
-
-def _get_orig_argv() -> Optional[List[str]]:
-    try:
-        from sys import orig_argv  # since 3.10
-
-        return sys.orig_argv
-    except ImportError:
-        # https://stackoverflow.com/a/57914236/261181
-        import ctypes
-
-        argc = ctypes.c_int()
-        argv = ctypes.POINTER(ctypes.c_wchar_p if sys.version_info >= (3,) else ctypes.c_char_p)()
-        try:
-            ctypes.pythonapi.Py_GetArgcArgv(ctypes.byref(argc), ctypes.byref(argv))
-        except AttributeError:
-            # See https://github.com/thonny/thonny/issues/2206
-            # and https://bugs.python.org/issue40910
-            # This symbol is not available in thonny.exe built agains Python 3.8
-            return None
-
-        # Ctypes are weird. They can't be used in list comprehensions, you can't use `in` with them, and you can't
-        # use a for-each loop on them. We have to do an old-school for-i loop.
-        arguments = list()
-        for i in range(argc.value):
-            arguments.append(argv[i])
-
-        return arguments

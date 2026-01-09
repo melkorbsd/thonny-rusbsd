@@ -91,6 +91,9 @@ class MicroPythonProxy(SubprocessProxy):
     def has_local_interpreter(self):
         return False
 
+    def interpreter_is_cpython_compatible(self) -> bool:
+        return False
+
     def can_debug(self) -> bool:
         return False
 
@@ -337,7 +340,6 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
                 self.backend_name + ".interrupt_on_connect"
             ),
             "proxy_class": self.__class__.__name__,
-            "user_stubs_location": self.get_user_stubs_location(),
         }
         if self._port == WEBREPL_PORT_VALUE:
             args["url"] = get_workbench().get_option(self.backend_name + ".webrepl_url")
@@ -640,6 +642,10 @@ class BareMetalMicroPythonProxy(MicroPythonProxy):
 
     def get_machine_id(self) -> str:
         return self._machine_id
+
+    @classmethod
+    def get_vendored_user_stubs_ids(cls) -> List[str]:
+        return ["micropython-typeshed"]
 
 
 class BareMetalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
@@ -1200,7 +1206,6 @@ class LocalMicroPythonProxy(MicroPythonProxy):
                 {
                     "interpreter": self._target_executable,
                     "cwd": self.get_cwd(),
-                    "user_stubs_location": self.get_user_stubs_location(),
                 }
             ),
         ]
@@ -1294,12 +1299,17 @@ class LocalMicroPythonProxy(MicroPythonProxy):
     def can_install_packages_from_files(self) -> bool:
         return True
 
+    @classmethod
+    def get_vendored_user_stubs_ids(cls) -> List[str]:
+        return ["micropython-unix-typeshed"]
+
 
 class LocalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
 
     def __init__(self, master):
         super().__init__(master)
         self.executable_page = self.create_and_add_empty_page(tr("Executable"))
+        self.stubs_page = self.create_and_add_stubs_page(proxy_class=self.proxy_class)
 
         add_option_entry(
             self.executable_page, "LocalMicroPython.executable", tr("Interpreter"), width=30
@@ -1315,6 +1325,7 @@ class LocalMicroPythonConfigPage(TabbedBackendDetailsConfigurationPage):
 class SshMicroPythonProxy(MicroPythonProxy):
     def __init__(self, clean):
         self._host = get_workbench().get_option(f"{self.backend_name}.host")
+        self._port = get_workbench().get_option(f"{self.backend_name}.port")
         self._user = get_workbench().get_option(f"{self.backend_name}.user")
         self._target_executable = get_workbench().get_option(f"{self.backend_name}.executable")
 
@@ -1327,8 +1338,8 @@ class SshMicroPythonProxy(MicroPythonProxy):
             "cwd": get_workbench().get_option(f"{self.backend_name}.cwd") or "",
             "interpreter": self._target_executable,
             "host": self._host,
+            "port": self._port,
             "user": self._user,
-            "user_stubs_location": self.get_user_stubs_location(),
         }
 
         args.update(self._get_time_args())
@@ -1459,6 +1470,10 @@ class SshMicroPythonProxy(MicroPythonProxy):
 
     def get_machine_id(self) -> str:
         return self._host
+
+    @classmethod
+    def get_vendored_user_stubs_ids(cls) -> List[str]:
+        return ["micropython-unix-typeshed"]
 
 
 class SshMicroPythonConfigPage(BaseSshProxyConfigPage):

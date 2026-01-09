@@ -3,17 +3,13 @@ import platform
 from thonny import get_workbench
 from thonny.languages import tr
 from thonny.plugins.micropython.mp_front import (
-    BareMetalMicroPythonConfigPage,
-    BareMetalMicroPythonProxy,
     GenericBareMetalMicroPythonConfigPage,
     GenericBareMetalMicroPythonProxy,
     LocalMicroPythonConfigPage,
     LocalMicroPythonProxy,
-    MicroPythonProxy,
     SshMicroPythonConfigPage,
     SshMicroPythonProxy,
     add_micropython_backend,
-    list_serial_ports,
 )
 
 
@@ -52,6 +48,7 @@ def load_plugin():
     get_workbench().set_default("SshMicroPython.executable", "micropython")
     get_workbench().set_default("SshMicroPython.cwd", None)
     get_workbench().set_default("SshMicroPython.host", "")
+    get_workbench().set_default("SshMicroPython.port", "22")
     get_workbench().set_default("SshMicroPython.user", "")
     get_workbench().set_default("SshMicroPython.auth_method", "password")
     get_workbench().set_default("SshMicroPython.make_uploaded_shebang_scripts_executable", True)
